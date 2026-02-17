@@ -1,0 +1,77 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rsdb-common",
+    "crates/rsdb-catalog",
+    "crates/rsdb-storage",
+    "crates/rsdb-sql",
+    "crates/rsdb-planner",
+    "crates/rsdb-executor",
+    "crates/rsdb-network",
+    "crates/rsdb-coordinator",
+    "crates/rsdb-worker",
+    "crates/rsdb-server",
+]
+
+[workspace.dependencies]
+# Arrow ecosystem - version 57 for latest compatibility
+arrow = "57"
+arrow-array = "57"
+arrow-schema = "57"
+arrow-flight = { version = "57", features = ["flight-sql-experimental"] }
+arrow-ipc = "57"
+
+# DataFusion - version 52
+datafusion = "52"
+datafusion-common = "52"
+datafusion-expr = "52"
+datafusion-substrait = "52"
+
+# Substrait for query plan serialization
+substrait = "0.62.2"
+
+# Networking
+tonic = "0.14"
+tonic-build = "0.14"
+tonic-prost-build = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+
+# SQL
+sqlparser = "0.53"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# Utilities
+dashmap = "6"
+async-trait = "0.1"
+futures = "0.3"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+parking_lot = "0.12"
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+[profile.dev]
+opt-level = 0
+debug = true

@@ -1,0 +1,23 @@
+[package]
+name = "rsdb-planner"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rsdb-common = { path = "../rsdb-common" }
+rsdb-catalog = { path = "../rsdb-catalog" }
+rsdb-sql = { path = "../rsdb-sql" }
+
+datafusion = { workspace = true }
+substrait = { workspace = true }
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+parking_lot = { workspace = true }
+prost = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

@@ -1,0 +1,33 @@
+[package]
+name = "rsdb-server"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "rsdb"
+path = "src/main.rs"
+
+[dependencies]
+rsdb-common = { path = "../rsdb-common" }
+rsdb-catalog = { path = "../rsdb-catalog" }
+rsdb-storage = { path = "../rsdb-storage" }
+rsdb-executor = { path = "../rsdb-executor" }
+rsdb-coordinator = { path = "../rsdb-coordinator" }
+rsdb-worker = { path = "../rsdb-worker" }
+
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+datafusion = { workspace = true }
+
+# MySQL protocol server
+msql-srv = "0.11"
+
+# Arrow types for result conversion
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+
+# Date/time formatting for MySQL text protocol
+chrono = { workspace = true }

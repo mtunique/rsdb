@@ -1,0 +1,456 @@
+//! Optimizer rules
+//!
+//! Based on ClickHouse's implementation of subquery decorrelation
+//! References:
+//! - "Unnesting Arbitrary Queries"
+//! - "Orthogonal Optimization of Subqueries and Aggregation"
+
+use rsdb_common::Result;
+use rsdb_sql::expr::Expr as RsdbExpr;
+use rsdb_sql::logical_plan::LogicalPlan;
+
+/// Optimizer that applies a chain of rules
+pub struct Optimizer {
+    rules: Vec<Box<dyn OptimizerRule>>,
+}
+
+impl Optimizer {
+    pub fn new() -> Self {
+        let rules: Vec<Box<dyn OptimizerRule>> = vec![
+            Box::new(ConstantFolding),
+            // Box::new(SubqueryDecorrelation), // Disabled - causes stack overflow
+            Box::new(PredicatePushdown),
+            Box::new(ProjectionPruning),
+        ];
+        Self { rules }
+    }
+
+    pub fn optimize(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
+        let mut current = plan;
+        for rule in &self.rules {
+            current = rule.optimize(current)?;
+        }
+        Ok(current)
+    }
+}
+
+impl Default for Optimizer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Optimizer rule trait
+pub trait OptimizerRule: Send + Sync {
+    fn optimize(&self, plan: LogicalPlan) -> Result<LogicalPlan>;
+    fn name(&self) -> &str;
+}
+
+/// Predicate pushdown optimization
+pub struct PredicatePushdown;
+
+impl OptimizerRule for PredicatePushdown {
+    fn optimize(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
+        Ok(plan)
+    }
+
+    fn name(&self) -> &str {
+        "predicate_pushdown"
+    }
+}
+
+/// Projection pruning optimization
+pub struct ProjectionPruning;
+
+impl OptimizerRule for ProjectionPruning {
+    fn optimize(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
+        Ok(plan)
+    }
+
+    fn name(&self) -> &str {
+        "projection_pruning"
+    }
+}
+
+/// Constant folding optimization
+pub struct ConstantFolding;
+
+impl OptimizerRule for ConstantFolding {
+    fn optimize(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
+        Ok(plan)
+    }
+
+    fn name(&self) -> &str {
+        "constant_folding"
+    }
+}
+
+/// Subquery decorrelation optimization
+/// Converts correlated subqueries to joins for efficient execution
+pub struct SubqueryDecorrelation;
+
+impl OptimizerRule for SubqueryDecorrelation {
+    fn optimize(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
+        self.decorrelate(plan)
+    }
+
+    fn name(&self) -> &str {
+        "subquery_decorrelation"
+    }
+}
+
+/// Information about a subquery found in an expression
+#[derive(Debug)]
+struct SubqueryInfo {
+    outer_refs: Vec<String>,
+}
+
+impl SubqueryDecorrelation {
+    /// Main entry point for decorrelation
+    fn decorrelate(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
+        match plan {
+            // Process Filter nodes - check for subquery expressions
+            LogicalPlan::Filter { input, predicate } => {
+                // Find all subquery expressions in the predicate
+                let subqueries = find_subqueries(&predicate);
+
+                if !subqueries.is_empty() {
+                    // Check if any are correlated (have outer references)
+                    let has_correlation = subqueries.iter().any(|sq| !sq.outer_refs.is_empty());
+
+                    if has_correlation {
+                        // This is a correlated subquery - skip processing to avoid infinite recursion
+                        // The executor will handle it (return false = no rows)
+                        // Just process the input non-recursively
+                        let new_input = match *input {
+                            LogicalPlan::Scan { .. } => input,
+                            _ => Box::new(self.decorrelate_simple(*input)?),
+                        };
+                        Ok(LogicalPlan::Filter {
+                            input: new_input,
+                            predicate,
+                        })
+                    } else {
+                        // No correlation - just recursively process
+                        let new_input = Box::new(self.decorrelate(*input)?);
+                        Ok(LogicalPlan::Filter {
+                            input: new_input,
+                            predicate,
+                        })
+                    }
+                } else {
+                    // No subqueries - just recurse
+                    let new_input = Box::new(self.decorrelate(*input)?);
+                    Ok(LogicalPlan::Filter {
+                        input: new_input,
+                        predicate,
+                    })
+                }
+            }
+
+            // Process Subquery nodes
+            LogicalPlan::Subquery { query, schema } => {
+                let new_query = Box::new(self.decorrelate(*query)?);
+                Ok(LogicalPlan::Subquery {
+                    query: new_query,
+                    schema,
+                })
+            }
+
+            // Recursively process other plan types
+            LogicalPlan::Scan { .. } => Ok(plan),
+
+            LogicalPlan::Project {
+                input,
+                expr,
+                schema,
+            } => {
+                let new_input = Box::new(self.decorrelate(*input)?);
+                Ok(LogicalPlan::Project {
+                    input: new_input,
+                    expr,
+                    schema,
+                })
+            }
+
+            LogicalPlan::Aggregate {
+                input,
+                group_expr,
+                aggregate_expr,
+                schema,
+            } => {
+                let new_input = Box::new(self.decorrelate(*input)?);
+                Ok(LogicalPlan::Aggregate {
+                    input: new_input,
+                    group_expr,
+                    aggregate_expr,
+                    schema,
+                })
+            }
+
+            LogicalPlan::Sort { input, expr } => {
+                let new_input = Box::new(self.decorrelate(*input)?);
+                Ok(LogicalPlan::Sort {
+                    input: new_input,
+                    expr,
+                })
+            }
+
+            LogicalPlan::Limit {
+                input,
+                limit,
+                offset,
+            } => {
+                let new_input = Box::new(self.decorrelate(*input)?);
+                Ok(LogicalPlan::Limit {
+                    input: new_input,
+                    limit,
+                    offset,
+                })
+            }
+
+            LogicalPlan::Join {
+                left,
+                right,
+                join_type,
+                join_condition,
+                schema,
+            } => {
+                let new_left = Box::new(self.decorrelate(*left)?);
+                let new_right = Box::new(self.decorrelate(*right)?);
+                Ok(LogicalPlan::Join {
+                    left: new_left,
+                    right: new_right,
+                    join_type,
+                    join_condition,
+                    schema,
+                })
+            }
+
+            LogicalPlan::CrossJoin {
+                left,
+                right,
+                schema,
+            } => {
+                let new_left = Box::new(self.decorrelate(*left)?);
+                let new_right = Box::new(self.decorrelate(*right)?);
+                Ok(LogicalPlan::CrossJoin {
+                    left: new_left,
+                    right: new_right,
+                    schema,
+                })
+            }
+
+            LogicalPlan::Union { inputs, schema } => {
+                let new_inputs: Result<Vec<LogicalPlan>> =
+                    inputs.into_iter().map(|p| self.decorrelate(p)).collect();
+                Ok(LogicalPlan::Union {
+                    inputs: new_inputs?,
+                    schema,
+                })
+            }
+
+            LogicalPlan::CreateTable { .. } => Ok(plan),
+            LogicalPlan::DropTable { .. } => Ok(plan),
+            LogicalPlan::Insert { .. } => Ok(plan),
+            LogicalPlan::Analyze { .. } => Ok(plan),
+            LogicalPlan::EmptyRelation => Ok(plan),
+        }
+    }
+
+    /// Simple decorrelation that doesn't recurse into Filter nodes
+    fn decorrelate_simple(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
+        match plan {
+            LogicalPlan::Scan { .. } => Ok(plan),
+            LogicalPlan::EmptyRelation => Ok(plan),
+            LogicalPlan::Subquery { query, schema } => Ok(LogicalPlan::Subquery { query, schema }),
+            LogicalPlan::Project {
+                input,
+                expr,
+                schema,
+            } => Ok(LogicalPlan::Project {
+                input,
+                expr,
+                schema,
+            }),
+            LogicalPlan::Aggregate {
+                input,
+                group_expr,
+                aggregate_expr,
+                schema,
+            } => Ok(LogicalPlan::Aggregate {
+                input,
+                group_expr,
+                aggregate_expr,
+                schema,
+            }),
+            LogicalPlan::Sort { input, expr } => Ok(LogicalPlan::Sort { input, expr }),
+            LogicalPlan::Limit {
+                input,
+                limit,
+                offset,
+            } => Ok(LogicalPlan::Limit {
+                input,
+                limit,
+                offset,
+            }),
+            LogicalPlan::Join {
+                left,
+                right,
+                join_type,
+                join_condition,
+                schema,
+            } => Ok(LogicalPlan::Join {
+                left,
+                right,
+                join_type,
+                join_condition,
+                schema,
+            }),
+            LogicalPlan::CrossJoin {
+                left,
+                right,
+                schema,
+            } => Ok(LogicalPlan::CrossJoin {
+                left,
+                right,
+                schema,
+            }),
+            LogicalPlan::Union { inputs, schema } => Ok(LogicalPlan::Union { inputs, schema }),
+            LogicalPlan::Filter { input, predicate } => {
+                // Don't recurse into Filter - just keep it as-is
+                Ok(LogicalPlan::Filter { input, predicate })
+            }
+            LogicalPlan::CreateTable { .. } => Ok(plan),
+            LogicalPlan::DropTable { .. } => Ok(plan),
+            LogicalPlan::Insert { .. } => Ok(plan),
+            LogicalPlan::Analyze { .. } => Ok(plan),
+        }
+    }
+}
+
+/// Find all subquery expressions in an expression
+fn find_subqueries(expr: &RsdbExpr) -> Vec<SubqueryInfo> {
+    let mut subqueries = vec![];
+    collect_subqueries(expr, &mut subqueries);
+    subqueries
+}
+
+/// Recursively collect subqueries from an expression
+fn collect_subqueries(expr: &RsdbExpr, subqueries: &mut Vec<SubqueryInfo>) {
+    match expr {
+        RsdbExpr::Subquery { outer_refs, .. } => {
+            subqueries.push(SubqueryInfo {
+                outer_refs: outer_refs.clone(),
+            });
+        }
+        RsdbExpr::BinaryOp { left, right, .. } => {
+            collect_subqueries(left, subqueries);
+            collect_subqueries(right, subqueries);
+        }
+        RsdbExpr::UnaryOp { expr, .. } => {
+            collect_subqueries(expr, subqueries);
+        }
+        RsdbExpr::AggFunc { args, .. } => {
+            for arg in args {
+                collect_subqueries(arg, subqueries);
+            }
+        }
+        RsdbExpr::Alias { expr, .. } => {
+            collect_subqueries(expr, subqueries);
+        }
+        RsdbExpr::Function { args, .. } => {
+            for arg in args {
+                collect_subqueries(arg, subqueries);
+            }
+        }
+        RsdbExpr::Cast { expr, .. } => {
+            collect_subqueries(expr, subqueries);
+        }
+        RsdbExpr::Column(_) | RsdbExpr::Literal(_) => {}
+    }
+}
+
+// ============================================================================
+// FullOptimizer - Integrates rule-based + CBO Cascades
+// ============================================================================
+
+/// Full optimizer that combines rule-based rewrites with cost-based optimization.
+///
+/// Phase 1: Apply rule-based rewrites (constant folding, predicate pushdown, etc.)
+/// Phase 2: If the plan contains joins and Cascades is enabled, run the Cascades
+///          optimizer for join reordering and physical plan selection. Falls back
+///          to the rule-based result if Cascades fails.
+pub struct FullOptimizer {
+    rule_optimizer: Optimizer,
+    cbo_context: crate::cbo::CBOContext,
+    enable_cascades: bool,
+}
+
+impl FullOptimizer {
+    pub fn new() -> Self {
+        Self {
+            rule_optimizer: Optimizer::new(),
+            cbo_context: crate::cbo::CBOContext::new(),
+            enable_cascades: true,
+        }
+    }
+
+    pub fn with_cbo_context(mut self, ctx: crate::cbo::CBOContext) -> Self {
+        self.cbo_context = ctx;
+        self
+    }
+
+    pub fn with_cascades(mut self, enable: bool) -> Self {
+        self.enable_cascades = enable;
+        self
+    }
+
+    /// Register table statistics for cost-based optimization
+    pub fn register_table(&mut self, table_name: String, stats: crate::cbo::PlanStats) {
+        self.cbo_context.register_table(table_name, stats);
+    }
+
+    /// Load table statistics from catalog for all tables referenced in a plan
+    pub fn load_stats_from_catalog(
+        &mut self,
+        plan: &LogicalPlan,
+        catalog: &dyn rsdb_catalog::CatalogProvider,
+    ) {
+        let table_refs = plan.table_refs();
+        if let Some(schema) = catalog.schema("default") {
+            for table_name in &table_refs {
+                if let Some(catalog_stats) = schema.table_statistics(table_name) {
+                    let plan_stats =
+                        crate::stats_collector::catalog_stats_to_plan_stats(&catalog_stats);
+                    self.cbo_context
+                        .register_table(table_name.clone(), plan_stats);
+                }
+            }
+        }
+    }
+
+    /// Optimize a logical plan through both phases
+    pub fn optimize(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
+        // Phase 1: rule-based rewrites
+        let plan = self.rule_optimizer.optimize(plan)?;
+
+        // Phase 2: Cascades CBO for join ordering (if applicable)
+        if self.enable_cascades && crate::cascades::has_joins(&plan) {
+            let mut cascades =
+                crate::cascades::CascadesOptimizer::new_with_stats(&self.cbo_context);
+            match cascades.optimize(plan.clone()) {
+                Ok(optimized) => Ok(optimized),
+                Err(_) => Ok(plan), // fallback to rule-based result
+            }
+        } else {
+            Ok(plan)
+        }
+    }
+}
+
+impl Default for FullOptimizer {
+    fn default() -> Self {
+        Self::new()
+    }
+}

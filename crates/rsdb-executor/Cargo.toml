@@ -1,0 +1,33 @@
+[package]
+name = "rsdb-executor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rsdb-common = { path = "../rsdb-common" }
+rsdb-catalog = { path = "../rsdb-catalog" }
+rsdb-storage = { path = "../rsdb-storage" }
+rsdb-planner = { path = "../rsdb-planner" }
+rsdb-sql = { path = "../rsdb-sql" }
+
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+datafusion = { workspace = true }
+datafusion-common = { workspace = true }
+datafusion-expr = { workspace = true }
+datafusion-substrait = { workspace = true }
+prost = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+parking_lot = { workspace = true }
+futures = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+
+[features]
+# Enable slow / data-dependent TPC-DS integration tests.
+tpcds = []

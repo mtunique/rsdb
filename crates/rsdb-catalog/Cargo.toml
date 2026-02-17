@@ -1,0 +1,18 @@
+[package]
+name = "rsdb-catalog"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rsdb-common = { path = "../rsdb-common" }
+
+async-trait = { workspace = true }
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
+arrow-schema = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+rsdb-common = { path = "../rsdb-common" }

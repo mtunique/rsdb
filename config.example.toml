@@ -1,0 +1,26 @@
+# RSDB example config (coordinator + optional MySQL protocol)
+
+mode = "coordinator"
+
+[listen_addr]
+host = "127.0.0.1"
+port = 8819
+
+# For worker mode only. Example:
+# [coordinator_addr]
+# host = "127.0.0.1"
+# port = 8819
+
+# Data directory for storage
+data_dir = "/tmp/rsdb"
+
+# For worker mode only. Example:
+# worker_id = "worker-1"
+
+max_concurrent_queries = 10
+heartbeat_interval_secs = 30
+
+# Optional: enable MySQL wire protocol server on the coordinator
+[mysql_listen_addr]
+host = "127.0.0.1"
+port = 3307

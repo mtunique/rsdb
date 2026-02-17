@@ -1,0 +1,33 @@
+# Rust
+/target
+Cargo.lock
+
+# Data & Benchmarks
+*.duckdb
+/data/tpch/*.csv
+/data/tpcds/*.csv
+/data/tpch_queries/
+/data/tpcds_queries/
+
+# IDEs
+.idea/
+.vscode/
+.claude/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+
+# Temporary files
+*.log
+/tmp/

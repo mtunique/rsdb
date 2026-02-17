@@ -1,0 +1,20 @@
+# RSDB worker example config
+
+mode = "worker"
+
+[listen_addr]
+host = "127.0.0.1"
+port = 8820
+
+[coordinator_addr]
+host = "127.0.0.1"
+port = 8819
+
+# Data directory for storage
+data_dir = "/tmp/rsdb"
+
+# Worker ID (string, parsed as integer in current implementation)
+worker_id = "1"
+
+max_concurrent_queries = 10
+heartbeat_interval_secs = 30

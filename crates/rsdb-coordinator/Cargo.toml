@@ -1,0 +1,41 @@
+[package]
+name = "rsdb-coordinator"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+# Enable slow / data-dependent TPC-DS tests.
+tpcds = []
+
+[dependencies]
+rsdb-common = { path = "../rsdb-common" }
+rsdb-catalog = { path = "../rsdb-catalog" }
+rsdb-sql = { path = "../rsdb-sql" }
+rsdb-planner = { path = "../rsdb-planner" }
+rsdb-executor = { path = "../rsdb-executor" }
+rsdb-storage = { path = "../rsdb-storage" }
+arrow-flight = { workspace = true, features = ["flight-sql-experimental"] }
+
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-ipc = { workspace = true }
+datafusion = { workspace = true }
+datafusion-substrait = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+prost = { workspace = true }
+futures = { workspace = true }
+tonic = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = { workspace = true }
+rsdb-worker = { path = "../rsdb-worker" }

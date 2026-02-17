@@ -1,0 +1,21 @@
+[package]
+name = "rsdb-storage"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rsdb-common = { path = "../rsdb-common" }
+rsdb-catalog = { path = "../rsdb-catalog" }
+
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+parking_lot = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+tempfile = { workspace = true }

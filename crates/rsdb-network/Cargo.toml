@@ -1,0 +1,26 @@
+[package]
+name = "rsdb-network"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rsdb-common = { path = "../rsdb-common" }
+
+arrow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-flight = { workspace = true }
+arrow-ipc = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+async-trait = { workspace = true }
+dashmap = { workspace = true }
+parking_lot = { workspace = true }
+futures = { workspace = true }
+substrait = { workspace = true }
+
+[build-dependencies]
+tonic-build = { workspace = true }
