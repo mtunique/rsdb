@@ -18,6 +18,7 @@ use rsdb_common::rpc::worker_task_client::WorkerTaskClient;
 use rsdb_common::rpc::{
     ExecutePlanFragmentRequest, RegisterCsvRequest, RegisterParquetRequest,
 };
+use prost::Message;
 use tonic::transport::Channel;
 use tonic::Code;
 
@@ -108,35 +109,37 @@ impl Coordinator {
         workers: &[rsdb_common::types::WorkerInfo],
     ) -> Result<Vec<RecordBatch>> {
         // Build an optimized DataFusion logical plan on the coordinator.
-        let engine = self
-            .executor
-            .as_any()
-            .downcast_ref::<DataFusionEngine>()
-            .ok_or_else(|| RsdbError::Coordinator("Engine is not DataFusion".to_string()))?;
+        let (plan, state) = {
+            let engine = self
+                .executor
+                .as_any()
+                .downcast_ref::<DataFusionEngine>()
+                .ok_or_else(|| RsdbError::Coordinator("Engine is not DataFusion".to_string()))?;
 
-        let df = engine
-            .session_context()
-            .sql(sql)
-            .await
-            .map_err(|e| RsdbError::Execution(format!("SQL planning error: {e}")))?;
-        let plan = df
-            .into_optimized_plan()
-            .map_err(|e| RsdbError::Execution(format!("Failed to build optimized plan: {e}")))?;
+            let df = engine
+                .session_context()
+                .sql(sql)
+                .await
+                .map_err(|e| RsdbError::Execution(format!("SQL planning error: {e}")))?;
+            let plan = df.into_optimized_plan().map_err(|e| {
+                RsdbError::Execution(format!("Failed to build optimized plan: {e}"))
+            })?;
+            let state = engine.session_context().state();
+            (plan, state)
+        };
 
         let fragments = self.fragmentize_datafusion_plan(&plan, workers)?;
 
         let mut tasks = Vec::with_capacity(fragments.len());
         for (addr, sub_plan) in fragments {
-            let state = engine.session_context().state();
             let substrait_plan = datafusion_substrait::logical_plan::producer::to_substrait_plan(
                 &sub_plan,
                 &state,
             )
             .map_err(|e| RsdbError::Execution(format!("Failed to produce Substrait plan: {e}")))?;
 
-            let plan_bytes = substrait_plan
-                .encode_to_vec();
-            tasks.push(self.execute_plan_fragment_on_worker(&addr, plan_bytes));
+            let plan_bytes = substrait_plan.encode_to_vec();
+            tasks.push(self.execute_plan_fragment_on_worker(addr, plan_bytes));
         }
 
         let results: Vec<Vec<RecordBatch>> = futures::future::try_join_all(tasks).await?;
@@ -156,11 +159,11 @@ impl Coordinator {
 
         match plan {
             LogicalPlan::Union(u) => {
-                let inputs = u.inputs().to_vec();
+                let inputs = u.inputs.to_vec();
                 let mut out = Vec::with_capacity(inputs.len());
                 for (i, p) in inputs.into_iter().enumerate() {
                     let w = &workers[i % workers.len()];
-                    out.push((w.addr.clone(), p));
+                    out.push((w.addr.clone(), (*p).clone()));
                 }
                 Ok(out)
             }
@@ -195,12 +198,12 @@ impl Coordinator {
 
     async fn execute_plan_fragment_on_worker(
         &self,
-        worker_addr: &str,
+        worker_addr: String,
         plan_bytes: Vec<u8>,
     ) -> Result<Vec<RecordBatch>> {
         use std::io::Cursor;
 
-        let mut client = Self::worker_task_client(worker_addr).await?;
+        let mut client = Self::worker_task_client(&worker_addr).await?;
         let resp = client
             .execute_plan_fragment(ExecutePlanFragmentRequest { plan_bytes })
             .await

@@ -93,10 +93,33 @@ async fn test_multi_worker_register_and_execute_select() {
         .expect("count is int64");
     assert_eq!(arr.value(0), 25);
 
+    // UNION ALL should be split into multiple fragments and executed across workers.
+    let union_batches = {
+        let mut coord = coordinator.lock().await;
+        coord.execute_query(
+            "SELECT COUNT(*) AS c FROM nation UNION ALL SELECT COUNT(*) AS c FROM nation",
+        )
+        .await
+        .expect("execute union query")
+    };
+    assert!(!union_batches.is_empty());
+    let mut values = Vec::new();
+    for b in &union_batches {
+        let a = b
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("count is int64");
+        for i in 0..a.len() {
+            values.push(a.value(i));
+        }
+    }
+    values.sort();
+    assert_eq!(values, vec![25, 25]);
+
     // Cleanup.
     coord_handle.abort();
     for h in worker_handles {
         h.abort();
     }
 }
-
