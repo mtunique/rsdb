@@ -262,6 +262,10 @@ impl SubqueryDecorrelation {
             LogicalPlan::DropTable { .. } => Ok(plan),
             LogicalPlan::Insert { .. } => Ok(plan),
             LogicalPlan::Analyze { .. } => Ok(plan),
+            LogicalPlan::Explain { input } => {
+                let new_input = Box::new(self.decorrelate(*input)?);
+                Ok(LogicalPlan::Explain { input: new_input })
+            }
             LogicalPlan::SubqueryAlias { input, alias } => {
                 let new_input = Box::new(self.decorrelate(*input)?);
                 Ok(LogicalPlan::SubqueryAlias {
@@ -357,6 +361,7 @@ impl SubqueryDecorrelation {
             LogicalPlan::DropTable { .. } => Ok(plan),
             LogicalPlan::Insert { .. } => Ok(plan),
             LogicalPlan::Analyze { .. } => Ok(plan),
+            LogicalPlan::Explain { input } => Ok(LogicalPlan::Explain { input }),
             LogicalPlan::SubqueryAlias { input, alias } => Ok(LogicalPlan::SubqueryAlias { input, alias }),
         }
     }

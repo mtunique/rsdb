@@ -65,6 +65,7 @@ impl FragmentPlanner {
                     | LogicalPlan::Limit { input, .. }
                     | LogicalPlan::Subquery { query: input, .. }
                     | LogicalPlan::SubqueryAlias { input, .. }
+                    | LogicalPlan::Explain { input, .. }
                     | LogicalPlan::Exchange { input, .. }
                     | LogicalPlan::Insert { source: input, .. } => {
                         child_ids.push(self.split_recursive(input, fragments)?);

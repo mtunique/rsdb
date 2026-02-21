@@ -75,6 +75,7 @@ impl ExprFingerprint {
             }
             LogicalPlan::Insert { table_name, .. } => ("Insert".to_string(), table_name.clone()),
             LogicalPlan::Analyze { table_name } => ("Analyze".to_string(), table_name.clone()),
+            LogicalPlan::Explain { .. } => ("Explain".to_string(), String::new()),
             LogicalPlan::EmptyRelation => ("EmptyRelation".to_string(), String::new()),
         };
         Self {

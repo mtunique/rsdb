@@ -109,6 +109,11 @@ pub enum LogicalPlan {
         table_name: String,
     },
 
+    /// Explain plan
+    Explain {
+        input: Box<LogicalPlan>,
+    },
+
     /// Logical Exchange (Repartitioning)
     Exchange {
         input: Box<LogicalPlan>,
@@ -186,6 +191,7 @@ impl LogicalPlan {
             LogicalPlan::DropTable { .. } => Arc::new(Schema::empty()),
             LogicalPlan::Insert { source, .. } => source.schema(),
             LogicalPlan::Analyze { .. } => Arc::new(Schema::empty()),
+            LogicalPlan::Explain { .. } => Arc::new(Schema::new(vec![Field::new("plan", arrow_schema::DataType::Utf8, false)])),
             LogicalPlan::Exchange { input, .. } | LogicalPlan::RemoteExchange { input, .. } => input.schema(),
             LogicalPlan::EmptyRelation => Arc::new(Schema::empty()),
         }
@@ -223,6 +229,7 @@ impl LogicalPlan {
             LogicalPlan::DropTable { table_name, .. } => vec![table_name.clone()],
             LogicalPlan::Insert { source, .. } => source.table_refs(),
             LogicalPlan::Analyze { table_name } => vec![table_name.clone()],
+            LogicalPlan::Explain { input } => input.table_refs(),
             LogicalPlan::Exchange { input, .. } | LogicalPlan::RemoteExchange { input, .. } => input.table_refs(),
             LogicalPlan::EmptyRelation => vec![],
         }

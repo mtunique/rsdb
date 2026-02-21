@@ -33,6 +33,10 @@ impl SqlPlanner {
                 let name = table_name.0.first().map(|n| n.value.clone()).unwrap();
                 Ok(LogicalPlan::Analyze { table_name: name })
             }
+            Statement::Explain { statement, .. } => {
+                let input = self.statement_to_plan(statement)?;
+                Ok(LogicalPlan::Explain { input: Box::new(input) })
+            }
             _ => Err(RsdbError::Planner("Only SELECT supported".to_string())),
         }
     }

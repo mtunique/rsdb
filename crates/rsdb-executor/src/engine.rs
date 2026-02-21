@@ -83,6 +83,7 @@ impl DataFusionEngine {
     pub async fn execute_logical_plan(&self, plan: &RsdbLogicalPlan) -> Result<Vec<RecordBatch>> {
         match plan {
             RsdbLogicalPlan::Analyze { table_name } => {
+                // ... (ANALYZE 逻辑保持不变)
                 let df = self.ctx.table(table_name.as_str()).await
                     .map_err(|e| RsdbError::Execution(format!("table not found: {e}")))?;
                 let batches = df.aggregate(vec![], vec![datafusion::functions_aggregate::expr_fn::count(datafusion::prelude::lit(1))])
@@ -118,6 +119,14 @@ impl DataFusionEngine {
                     }
                 }
                 Ok(vec![])
+            }
+            RsdbLogicalPlan::Explain { input } => {
+                let plan_str = format!("{:#?}", input);
+                let schema = plan.schema();
+                let array = arrow_array::StringArray::from(vec![plan_str]);
+                let batch = RecordBatch::try_new(schema, vec![Arc::new(array)])
+                    .map_err(|e| RsdbError::Execution(e.to_string()))?;
+                Ok(vec![batch])
             }
             _ => {
                 let df_plan = to_datafusion_plan(plan, &self.ctx)?;
