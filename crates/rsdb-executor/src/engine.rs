@@ -82,7 +82,43 @@ impl DataFusionEngine {
 
     pub async fn execute_logical_plan(&self, plan: &RsdbLogicalPlan) -> Result<Vec<RecordBatch>> {
         match plan {
-            RsdbLogicalPlan::Analyze { .. } => Ok(vec![]),
+            RsdbLogicalPlan::Analyze { table_name } => {
+                let df = self.ctx.table(table_name.as_str()).await
+                    .map_err(|e| RsdbError::Execution(format!("table not found: {e}")))?;
+                let batches = df.aggregate(vec![], vec![datafusion::functions_aggregate::expr_fn::count(datafusion::prelude::lit(1))])
+                    .map_err(|e| RsdbError::Execution(format!("aggregate error: {e}")))?
+                    .collect().await
+                    .map_err(|e| RsdbError::Execution(format!("collect error: {e}")))?;
+                
+                if !batches.is_empty() && batches[0].num_rows() > 0 {
+                    let count = batches[0].column(0)
+                        .as_any().downcast_ref::<arrow_array::Int64Array>()
+                        .map(|a| a.value(0) as u64).unwrap_or(0);
+                    
+                    // Update catalog
+                    let catalog = self.build_catalog_from_datafusion().await?;
+                    if let Some(schema) = catalog.schema("default") {
+                        let mut stats = rsdb_catalog::TableStatistics {
+                            row_count: count,
+                            total_size_bytes: count * 100, // Heuristic
+                            ..Default::default()
+                        };
+                        // Add some dummy column stats for CBO to have something to work with
+                        if let Some(table) = schema.table(table_name) {
+                            for field in table.schema.fields() {
+                                stats.column_statistics.insert(field.name().clone(), rsdb_catalog::ColumnStatistics {
+                                    distinct_count: count / 10 + 1, // Heuristic
+                                    null_count: 0,
+                                    ..Default::default()
+                                });
+                            }
+                        }
+                        schema.set_table_statistics(table_name, stats);
+                        println!("Analyzed table {}: {} rows", table_name, count);
+                    }
+                }
+                Ok(vec![])
+            }
             _ => {
                 let df_plan = to_datafusion_plan(plan, &self.ctx)?;
                 

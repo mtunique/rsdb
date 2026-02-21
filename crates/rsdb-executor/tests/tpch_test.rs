@@ -56,10 +56,14 @@ async fn setup_engine() -> Option<Arc<DataFusionEngine>> {
                 )
                 .await
                 .unwrap();
+            
+            // RUN ANALYZE to collect statistics for CBO
+            println!("Analyzing {}...", name);
+            engine.execute_sql(&format!("ANALYZE TABLE {};", name)).await.unwrap();
         }
     }
 
-    println!("Registered 8 TPC-H tables with explicit schemas");
+    println!("Registered 8 TPC-H tables with explicit schemas and collected statistics");
     Some(engine)
 }
 
