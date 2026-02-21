@@ -1,6 +1,6 @@
 //! Fragment planner - splits a LogicalPlan into independent fragments at Exchange boundaries.
 
-use rsdb_common::{Result, RsdbError};
+use rsdb_common::Result;
 use rsdb_sql::logical_plan::LogicalPlan;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -76,10 +76,10 @@ impl FragmentPlanner {
                         }
                     }
                     LogicalPlan::Scan { .. } | LogicalPlan::EmptyRelation | LogicalPlan::CreateTable { .. } 
-                    | LogicalPlan::DropTable { .. } | LogicalPlan::Insert { .. } | LogicalPlan::Analyze { .. } => {
+                    | LogicalPlan::DropTable { .. } | LogicalPlan::Analyze { .. } => {
                         // Leaf nodes, no children to split
                     }
-                    LogicalPlan::Exchange { .. } | LogicalPlan::RemoteExchange { .. } => unreachable!("handled above"),
+                    LogicalPlan::RemoteExchange { .. } => unreachable!("handled above"),
                 }
 
                 // Create fragment for current node (or sub-tree)

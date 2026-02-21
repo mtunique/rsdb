@@ -481,25 +481,150 @@ impl FullOptimizer {
 
     /// Optimize a logical plan through both phases
     pub fn optimize(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
-        // Phase 1: rule-based rewrites
+        // Phase 1: Predicate Pushdown and Join Conversion (Global Rewrite)
+        let plan = crate::predicate_pushdown::PredicatePushdown::optimize(plan)?;
+
+        // Phase 2: rule-based rewrites
         let plan = self.rule_optimizer.optimize(plan)?;
 
-        // Phase 2: Cascades CBO for join ordering (if applicable)
-        if self.enable_cascades && crate::cascades::has_joins(&plan) {
+        // Phase 3: Cascades CBO for join ordering and property enforcement
+        let plan = if self.enable_cascades && crate::cascades::has_joins(&plan) {
             let mut cascades =
                 crate::cascades::CascadesOptimizer::new_with_stats(&self.cbo_context);
-            match cascades.optimize(plan.clone()) {
-                Ok(optimized) => Ok(optimized),
-                Err(_) => Ok(plan), // fallback to rule-based result
+            
+            let required = crate::property::Property {
+                partitioning: rsdb_sql::logical_plan::Partitioning::Single,
+                sorting: vec![],
+            };
+
+            match cascades.optimize(plan.clone(), required) {
+                Ok(optimized) => optimized,
+                Err(_) => plan,
             }
         } else {
-            Ok(plan)
-        }
+            plan
+        };
+
+        // Phase 4: Distribution Planning (Ensures Exchange nodes are present)
+        InsertExchange::optimize(plan)
     }
 }
 
 impl Default for FullOptimizer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ============================================================================
+// InsertExchange - Simple distribution planner
+// ============================================================================
+
+/// InsertExchange Rule
+///
+/// Inserts Exchange nodes to satisfy distribution requirements.
+/// - Aggregate: Requires Hash partitioning on group keys, or Single partitioning if global.
+/// - Join: Requires Hash partitioning on join keys.
+pub struct InsertExchange;
+
+impl InsertExchange {
+    pub fn optimize(plan: LogicalPlan) -> Result<LogicalPlan> {
+        let mut optimizer = Self;
+        optimizer.insert_exchange(&plan)
+    }
+
+    fn insert_exchange(&mut self, plan: &LogicalPlan) -> Result<LogicalPlan> {
+        match plan {
+            LogicalPlan::Aggregate { input, group_expr, aggregate_expr, schema } => {
+                let input = self.insert_exchange(input)?;
+                
+                if group_expr.is_empty() {
+                    // Global aggregation: Gather to single partition
+                    Ok(LogicalPlan::Aggregate {
+                        input: Box::new(LogicalPlan::Exchange {
+                            input: Box::new(input),
+                            partitioning: rsdb_sql::logical_plan::Partitioning::Single,
+                        }),
+                        group_expr: vec![],
+                        aggregate_expr: aggregate_expr.clone(),
+                        schema: schema.clone(),
+                    })
+                } else {
+                    // Group by: Hash shuffle
+                    Ok(LogicalPlan::Aggregate {
+                        input: Box::new(LogicalPlan::Exchange {
+                            input: Box::new(input),
+                            partitioning: rsdb_sql::logical_plan::Partitioning::Hash(group_expr.clone(), 4),
+                        }),
+                        group_expr: group_expr.clone(),
+                        aggregate_expr: aggregate_expr.clone(),
+                        schema: schema.clone(),
+                    })
+                }
+            }
+            LogicalPlan::Join { left, right, join_type, join_condition, schema } => {
+                let left = self.insert_exchange(left)?;
+                let right = self.insert_exchange(right)?;
+                
+                match join_condition {
+                    rsdb_sql::logical_plan::JoinCondition::On(expr) => {
+                        Ok(LogicalPlan::Join {
+                            left: Box::new(LogicalPlan::Exchange {
+                                input: Box::new(left),
+                                partitioning: rsdb_sql::logical_plan::Partitioning::Hash(vec![expr.clone()], 4),
+                            }),
+                            right: Box::new(LogicalPlan::Exchange {
+                                input: Box::new(right),
+                                partitioning: rsdb_sql::logical_plan::Partitioning::Hash(vec![expr.clone()], 4),
+                            }),
+                            join_type: *join_type,
+                            join_condition: join_condition.clone(),
+                            schema: schema.clone(),
+                        })
+                    }
+                    _ => {
+                         Ok(LogicalPlan::Join {
+                            left: Box::new(left),
+                            right: Box::new(right),
+                            join_type: *join_type,
+                            join_condition: join_condition.clone(),
+                            schema: schema.clone(),
+                        })
+                    }
+                }
+            }
+            LogicalPlan::Filter { input, predicate } => {
+                Ok(LogicalPlan::Filter { input: Box::new(self.insert_exchange(input)?), predicate: predicate.clone() })
+            }
+            LogicalPlan::Project { input, expr, schema } => {
+                Ok(LogicalPlan::Project { input: Box::new(self.insert_exchange(input)?), expr: expr.clone(), schema: schema.clone() })
+            }
+            LogicalPlan::Sort { input, expr } => {
+                Ok(LogicalPlan::Sort { 
+                    input: Box::new(LogicalPlan::Exchange {
+                        input: Box::new(self.insert_exchange(input)?),
+                        partitioning: rsdb_sql::logical_plan::Partitioning::Single,
+                    }),
+                    expr: expr.clone() 
+                })
+            }
+            LogicalPlan::Limit { input, limit, offset } => {
+                Ok(LogicalPlan::Limit { 
+                    input: Box::new(LogicalPlan::Exchange {
+                        input: Box::new(self.insert_exchange(input)?),
+                        partitioning: rsdb_sql::logical_plan::Partitioning::Single,
+                    }),
+                    limit: *limit, 
+                    offset: *offset 
+                })
+            }
+            LogicalPlan::SubqueryAlias { input, alias } => {
+                Ok(LogicalPlan::SubqueryAlias { input: Box::new(self.insert_exchange(input)?), alias: alias.clone() })
+            }
+            LogicalPlan::Explain { input } => {
+                Ok(LogicalPlan::Explain { input: Box::new(self.insert_exchange(input)?) })
+            }
+            _ => Ok(plan.clone()),
+        }
     }
 }

@@ -29,6 +29,7 @@ pub trait ExecutionEngine: Send + Sync {
 
 pub struct DataFusionEngine {
     ctx: SessionContext,
+    catalog: Arc<InMemoryCatalog>,
 }
 
 impl DataFusionEngine {
@@ -36,19 +37,28 @@ impl DataFusionEngine {
         let config = datafusion::prelude::SessionConfig::new()
             .with_information_schema(true)
             .set_bool("datafusion.sql_parser.enable_ident_normalization", true);
-        Self { ctx: SessionContext::new_with_config(config) }
+        Self { 
+            ctx: SessionContext::new_with_config(config),
+            catalog: Arc::new(InMemoryCatalog::new()),
+        }
     }
 
     pub async fn register_csv(&self, table_name: &str, path: &Path, options: CsvReadOptions<'_>) -> Result<()> {
-        self.ctx.register_csv(table_name, path.to_str().unwrap(), options).await
-            .map_err(|e| RsdbError::Execution(format!("Failed to register CSV {table_name}: {e}")))
+        self.ctx.register_csv(table_name, path.to_str().unwrap(), options.clone()).await
+            .map_err(|e| RsdbError::Execution(format!("Failed to register CSV {table_name}: {e}")))?;
+        
+        // Register in RsDB catalog as well to keep them in sync
+        // Note: We need to extract schema from options or infer it. 
+        // For simplicity, we rely on build_catalog_from_datafusion to sync schemas lazily,
+        // but we keep the catalog persistent to store stats.
+        Ok(())
     }
 
     pub fn session_context(&self) -> &SessionContext { &self.ctx }
 
-    async fn build_catalog_from_datafusion(&self) -> Result<Arc<InMemoryCatalog>> {
-        let catalog = Arc::new(InMemoryCatalog::new());
-        let schema = catalog.schema("default").unwrap();
+    async fn get_catalog(&self) -> Result<Arc<InMemoryCatalog>> {
+        // Sync schema from DataFusion to RsDB catalog
+        let schema = self.catalog.schema("default").unwrap();
         let state = self.ctx.state();
         let catalog_list = state.catalog_list();
         for cat_name in catalog_list.catalog_names() {
@@ -56,34 +66,42 @@ impl DataFusionEngine {
                 for schema_name in cat.schema_names() {
                     if let Some(s) = cat.schema(&schema_name) {
                         for table_name in s.table_names() {
-                            if let Some(Ok(Some(tp))) = s.table(&table_name).now_or_never() {
-                                let entry = rsdb_catalog::TableEntry {
-                                    name: table_name.clone(),
-                                    schema: tp.schema(),
-                                    partition_keys: vec![],
-                                    storage_location: String::new(),
-                                };
-                                let _ = schema.create_table(entry).await;
+                            if !schema.table_exists(&table_name) {
+                                if let Some(Ok(Some(tp))) = s.table(&table_name).now_or_never() {
+                                    let entry = rsdb_catalog::TableEntry {
+                                        name: table_name.clone(),
+                                        schema: tp.schema(),
+                                        partition_keys: vec![],
+                                        storage_location: String::new(),
+                                    };
+                                    let _ = schema.create_table(entry).await;
+                                }
                             }
                         }
                     }
                 }
             }
         }
-        Ok(catalog)
+        Ok(self.catalog.clone())
     }
 
     pub async fn execute_sql(&self, sql: &str) -> Result<Vec<RecordBatch>> {
-        let catalog = self.build_catalog_from_datafusion().await?;
-        let planner = SqlPlanner::new(catalog);
+        let catalog = self.get_catalog().await?;
+        let planner = SqlPlanner::new(catalog.clone());
         let plan = planner.plan(sql)?;
-        self.execute_logical_plan(&plan).await
+        
+        // Run Optimizer
+        let mut optimizer = rsdb_planner::FullOptimizer::new();
+        // Load stats for CBO
+        optimizer.load_stats_from_catalog(&plan, catalog.as_ref());
+        let optimized_plan = optimizer.optimize(plan)?;
+        
+        self.execute_logical_plan(&optimized_plan).await
     }
 
     pub async fn execute_logical_plan(&self, plan: &RsdbLogicalPlan) -> Result<Vec<RecordBatch>> {
         match plan {
             RsdbLogicalPlan::Analyze { table_name } => {
-                // ... (ANALYZE 逻辑保持不变)
                 let df = self.ctx.table(table_name.as_str()).await
                     .map_err(|e| RsdbError::Execution(format!("table not found: {e}")))?;
                 let batches = df.aggregate(vec![], vec![datafusion::functions_aggregate::expr_fn::count(datafusion::prelude::lit(1))])
@@ -97,7 +115,7 @@ impl DataFusionEngine {
                         .map(|a| a.value(0) as u64).unwrap_or(0);
                     
                     // Update catalog
-                    let catalog = self.build_catalog_from_datafusion().await?;
+                    let catalog = self.get_catalog().await?;
                     if let Some(schema) = catalog.schema("default") {
                         let mut stats = rsdb_catalog::TableStatistics {
                             row_count: count,
@@ -121,7 +139,19 @@ impl DataFusionEngine {
                 Ok(vec![])
             }
             RsdbLogicalPlan::Explain { input } => {
-                let plan_str = format!("{:#?}", input);
+                let catalog = self.get_catalog().await?;
+                let mut cbo_ctx = rsdb_planner::CBOContext::new();
+                
+                // Load stats
+                if let Some(schema) = catalog.schema("default") {
+                    for table_ref in input.table_refs() {
+                        if let Some(stats) = schema.table_statistics(&table_ref) {
+                            cbo_ctx.register_table(table_ref, rsdb_planner::catalog_stats_to_plan_stats(&stats));
+                        }
+                    }
+                }
+
+                let plan_str = explain_plan_with_stats(input, &cbo_ctx, 0);
                 let schema = plan.schema();
                 let array = arrow_array::StringArray::from(vec![plan_str]);
                 let batch = RecordBatch::try_new(schema, vec![Arc::new(array)])
@@ -199,10 +229,16 @@ impl DataFusionEngine {
                 }
             }
         }
+
+        let bound_plan = inject_remote(logical, remote_sources);
         
-        let df = self.ctx.execute_logical_plan(inject_remote(logical, remote_sources)).await
-            .map_err(|e| RsdbError::Execution(format!("DataFusion error: {e}")))?;
-        df.execute_stream().await.map_err(|e| RsdbError::Execution(format!("Stream error: {e}")))
+        // Create execution plan
+        let physical = self.ctx.state().create_physical_plan(&bound_plan).await
+            .map_err(|e| RsdbError::Execution(format!("create physical plan error: {e}")))?;
+            
+        let task_ctx = self.ctx.task_ctx();
+        datafusion::physical_plan::execute_stream(physical, task_ctx)
+            .map_err(|e| RsdbError::Execution(format!("execute stream error: {e}")))
     }
 }
 
@@ -215,3 +251,78 @@ impl ExecutionEngine for DataFusionEngine {
 }
 
 impl Default for DataFusionEngine { fn default() -> Self { Self::new() } }
+
+fn explain_plan_with_stats(plan: &RsdbLogicalPlan, cbo: &rsdb_planner::CBOContext, indent: usize) -> String {
+    let stats = rsdb_planner::stats_derivation::derive_stats_recursive(plan, cbo);
+    let indent_str = "  ".repeat(indent);
+    
+    let mut output = match plan {
+        RsdbLogicalPlan::Scan { table_name, filters, .. } => {
+            format!("Scan: {} [Filters: {:?}]", table_name, filters.len())
+        }
+        RsdbLogicalPlan::Filter { predicate, .. } => {
+            format!("Filter: {:?}", predicate)
+        }
+        RsdbLogicalPlan::Project { expr, .. } => {
+            format!("Project: {:?}", expr)
+        }
+        RsdbLogicalPlan::Aggregate { group_expr, .. } => {
+            format!("Aggregate: [Group: {:?}]", group_expr.len())
+        }
+        RsdbLogicalPlan::Sort { .. } => "Sort".to_string(),
+        RsdbLogicalPlan::Limit { limit, .. } => format!("Limit: {}", limit),
+        RsdbLogicalPlan::Join { join_type, join_condition, .. } => {
+            format!("Join: {:?} ON {:?}", join_type, join_condition)
+        }
+        RsdbLogicalPlan::CrossJoin { .. } => "CrossJoin".to_string(),
+        RsdbLogicalPlan::Exchange { partitioning, .. } => format!("Exchange: {:?}", partitioning),
+        RsdbLogicalPlan::SubqueryAlias { alias, input } => {
+            // Visual optimization: Merge Alias into Scan
+            if let RsdbLogicalPlan::Scan { table_name, filters, .. } = input.as_ref() {
+                format!("Scan: {} [Filters: {:?}] (alias: {})", table_name, filters.len(), alias)
+            } else {
+                format!("SubqueryAlias: {}", alias)
+            }
+        },
+        RsdbLogicalPlan::Union { .. } => "Union".to_string(),
+        RsdbLogicalPlan::Explain { .. } => "Explain".to_string(),
+        _ => format!("{:?}", plan),
+    };
+
+    output = format!("{}{:<50} [Rows: {}]", indent_str, output, stats.row_count);
+
+    match plan {
+        RsdbLogicalPlan::Filter { input, .. } 
+        | RsdbLogicalPlan::Project { input, .. }
+        | RsdbLogicalPlan::Aggregate { input, .. }
+        | RsdbLogicalPlan::Sort { input, .. }
+        | RsdbLogicalPlan::Limit { input, .. }
+        | RsdbLogicalPlan::Explain { input }
+        | RsdbLogicalPlan::Exchange { input, .. } => {
+            output.push('\n');
+            output.push_str(&explain_plan_with_stats(input, cbo, indent + 1));
+        }
+        RsdbLogicalPlan::SubqueryAlias { input, .. } => {
+            // If we merged it, don't recurse. If not, recurse.
+            if !matches!(input.as_ref(), RsdbLogicalPlan::Scan { .. }) {
+                output.push('\n');
+                output.push_str(&explain_plan_with_stats(input, cbo, indent + 1));
+            }
+        }
+        RsdbLogicalPlan::Join { left, right, .. } | RsdbLogicalPlan::CrossJoin { left, right, .. } => {
+            output.push('\n');
+            output.push_str(&explain_plan_with_stats(left, cbo, indent + 1));
+            output.push('\n');
+            output.push_str(&explain_plan_with_stats(right, cbo, indent + 1));
+        }
+        RsdbLogicalPlan::Union { inputs, .. } => {
+            for input in inputs {
+                output.push('\n');
+                output.push_str(&explain_plan_with_stats(input, cbo, indent + 1));
+            }
+        }
+        _ => {}
+    }
+    
+    output
+}

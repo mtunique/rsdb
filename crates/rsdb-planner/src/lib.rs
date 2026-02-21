@@ -5,6 +5,7 @@ pub mod cbo;
 pub mod fragment_planner;
 pub mod memo;
 pub mod optimizer;
+pub mod predicate_pushdown;
 pub mod property;
 pub mod stats_collector;
 pub mod stats_derivation;

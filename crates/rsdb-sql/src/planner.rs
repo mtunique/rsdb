@@ -1,6 +1,6 @@
 //! SQL to LogicalPlan planner - Robust Distributed Implementation
 
-use crate::expr::{AggFunction, BinaryOperator, Expr as RsdbExpr, Literal, SubqueryType, UnaryOperator};
+use crate::expr::{AggFunction, BinaryOperator, Expr as RsdbExpr, Literal};
 use crate::logical_plan::{JoinCondition, JoinType};
 use crate::{LogicalPlan, SqlParser};
 use arrow_schema::{DataType, Field, Schema};
@@ -50,7 +50,46 @@ impl SqlPlanner {
                 cte_map.insert(name, plan);
             }
         }
-        self.set_expr_to_plan(&query.body, &cte_map)
+        let mut plan = self.set_expr_to_plan(&query.body, &cte_map)?;
+
+        // Handle ORDER BY
+        if let Some(ref order_by) = query.order_by {
+            let mut order_exprs = Vec::new();
+            for sort in &order_by.exprs {
+                // Binding against current plan schema
+                let expr = self.bind_names(&sort.expr, &plan)?;
+                order_exprs.push(expr);
+            }
+            plan = LogicalPlan::Sort {
+                input: Box::new(plan),
+                expr: order_exprs,
+            };
+        }
+
+        // Handle LIMIT / OFFSET
+        if query.limit.is_some() || query.offset.is_some() {
+            let limit = query.limit.as_ref()
+                .and_then(|e| match e {
+                    sqlparser::ast::Expr::Value(sqlparser::ast::Value::Number(n, _)) => n.parse().ok(),
+                    _ => None
+                })
+                .unwrap_or(usize::MAX);
+            
+            let offset = query.offset.as_ref()
+                .and_then(|o| match &o.value {
+                    sqlparser::ast::Expr::Value(sqlparser::ast::Value::Number(n, _)) => n.parse().ok(),
+                    _ => None
+                })
+                .unwrap_or(0);
+
+            plan = LogicalPlan::Limit {
+                input: Box::new(plan),
+                limit,
+                offset,
+            };
+        }
+
+        Ok(plan)
     }
 
     fn set_expr_to_plan(&self, set_expr: &sqlparser::ast::SetExpr, cte_map: &HashMap<String, LogicalPlan>) -> Result<LogicalPlan> {
@@ -281,31 +320,19 @@ impl SqlPlanner {
                         .ok_or_else(|| RsdbError::Planner(format!("Table {} not found", table_name)))?;
                     LogicalPlan::Scan { table_name: table_name.clone(), schema, projection: None, filters: vec![] }
                 };
-                Ok(LogicalPlan::SubqueryAlias { input: Box::new(plan), alias: alias_name })
+                // Alias as Projection
+                Ok(self.apply_alias(plan, &alias_name, None))
             }
             TableFactor::Derived { subquery, alias, .. } => {
-                let mut plan = self.query_to_plan(subquery)?;
+                let plan = self.query_to_plan(subquery)?;
                 if let Some(alias) = alias {
                     let alias_name = alias.name.value.clone();
-                    if !alias.columns.is_empty() {
-                        let schema = plan.schema();
-                        if alias.columns.len() != schema.fields().len() {
-                            return Err(RsdbError::Planner(format!("Subquery alias has {} columns, but subquery has {} columns", alias.columns.len(), schema.fields().len())));
-                        }
-                        let mut exprs = Vec::new();
-                        let mut fields = Vec::new();
-                        for (i, col) in alias.columns.iter().enumerate() {
-                            let old_field = &schema.fields()[i];
-                            exprs.push(RsdbExpr::Column(old_field.name().clone()));
-                            fields.push(Field::new(col.name.value.clone(), old_field.data_type().clone(), old_field.is_nullable()));
-                        }
-                        plan = LogicalPlan::Project {
-                            input: Box::new(plan),
-                            expr: exprs,
-                            schema: Arc::new(Schema::new(fields)),
-                        };
-                    }
-                    Ok(LogicalPlan::SubqueryAlias { input: Box::new(plan), alias: alias_name })
+                    let columns = if !alias.columns.is_empty() {
+                        Some(alias.columns.iter().map(|c| c.name.value.clone()).collect())
+                    } else {
+                        None
+                    };
+                    Ok(self.apply_alias(plan, &alias_name, columns))
                 } else {
                     Err(RsdbError::Planner("Subquery must have an alias".to_string()))
                 }
@@ -314,6 +341,50 @@ impl SqlPlanner {
                 self.plan_table(table_with_joins, cte_map)
             }
             _ => Err(RsdbError::Planner("Unsupported relation".to_string())),
+        }
+    }
+
+    fn apply_alias(&self, input: LogicalPlan, alias: &str, column_aliases: Option<Vec<String>>) -> LogicalPlan {
+        let schema = input.schema();
+        let mut exprs = Vec::with_capacity(schema.fields().len());
+        let mut fields = Vec::with_capacity(schema.fields().len());
+
+        for (i, field) in schema.fields().iter().enumerate() {
+            let old_name = field.name();
+            
+            // Determine new name
+            // 1. If explicit column aliases provided, use them
+            // 2. Otherwise prefix with table alias
+            let new_name = if let Some(cols) = &column_aliases {
+                if i < cols.len() {
+                    // Explicit alias: "alias.col" (we qualify it to be safe)
+                    format!("{}.{}", alias, cols[i])
+                } else {
+                    // Fallback to prefix
+                    format!("{}.{}", alias, old_name)
+                }
+            } else {
+                // Prefix with table alias
+                // Important: If old_name already has dots, we might just be re-aliasing.
+                // Standard SQL: Alias REPLACES the old qualifier.
+                // So t1.a aliased as t2 becomes t2.a.
+                // We take the simple name (last part) and prepend the new alias.
+                let simple_name = old_name.split('.').last().unwrap_or(old_name);
+                format!("{}.{}", alias, simple_name)
+            };
+
+            exprs.push(RsdbExpr::Alias {
+                expr: Box::new(RsdbExpr::Column(old_name.clone())),
+                name: new_name.clone(),
+            });
+            
+            fields.push(Field::new(new_name, field.data_type().clone(), field.is_nullable()));
+        }
+
+        LogicalPlan::Project {
+            input: Box::new(input),
+            expr: exprs,
+            schema: Arc::new(Schema::new(fields)),
         }
     }
 

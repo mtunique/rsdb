@@ -1,6 +1,6 @@
 //! Static topology scheduler for MPP execution
 
-use rsdb_common::{NodeId, Result, RsdbError};
+use rsdb_common::{Result, RsdbError};
 use rsdb_planner::fragment_planner::PlanFragment;
 use rsdb_sql::logical_plan::{LogicalPlan, RemoteSource};
 use std::collections::HashMap;

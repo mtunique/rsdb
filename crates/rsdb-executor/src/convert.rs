@@ -1,7 +1,6 @@
 //! RSDB LogicalPlan to DataFusion LogicalPlan direct conversion
 
-use datafusion::catalog::TableProvider;
-use datafusion::common::{Column, ScalarValue, TableReference};
+use datafusion::common::{Column, ScalarValue};
 use datafusion::datasource::provider_as_source;
 use datafusion::functions_aggregate::expr_fn as agg_fn;
 use datafusion::logical_expr::{
@@ -128,6 +127,21 @@ pub fn to_datafusion_plan_with_sources(
             let provider = Arc::new(RemoteExchangeProvider { partitions: vec![locations], schema: Arc::new(input_df_plan.schema().as_arrow().clone()) });
             LogicalPlanBuilder::scan("remote_exchange", provider_as_source(provider), None)
                 .map_err(|e| RsdbError::Execution(format!("scan error: {e}")))?
+                .build().map_err(|e| RsdbError::Execution(format!("build error: {e}")))
+        }
+
+        RsdbLogicalPlan::Exchange { input, partitioning } => {
+            let input_plan = to_datafusion_plan_with_sources(input, ctx, remote_sources)?;
+            let df_partitioning = match partitioning {
+                rsdb_sql::logical_plan::Partitioning::Hash(exprs, n) => {
+                    let df_exprs: Result<Vec<_>> = exprs.iter().map(|e| to_datafusion_expr(e, ctx)).collect();
+                    datafusion::logical_expr::Partitioning::Hash(df_exprs?, *n)
+                }
+                rsdb_sql::logical_plan::Partitioning::RoundRobin(n) => datafusion::logical_expr::Partitioning::RoundRobinBatch(*n),
+                _ => datafusion::logical_expr::Partitioning::RoundRobinBatch(1), // Default/Single
+            };
+            LogicalPlanBuilder::from(input_plan).repartition(df_partitioning)
+                .map_err(|e| RsdbError::Execution(format!("repartition error: {e}")))?
                 .build().map_err(|e| RsdbError::Execution(format!("build error: {e}")))
         }
 

@@ -1,6 +1,5 @@
 //! Task runner for executing fragments
 
-use arrow_array::RecordBatch;
 use rsdb_common::Result;
 use rsdb_executor::ExecutionEngine;
 use std::sync::Arc;

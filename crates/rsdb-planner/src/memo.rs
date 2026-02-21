@@ -6,7 +6,7 @@
 
 use crate::cbo::Cost;
 use crate::property::{Property, Statistics};
-use rsdb_sql::logical_plan::{JoinCondition, JoinType, LogicalPlan};
+use rsdb_sql::logical_plan::{LogicalPlan, Partitioning};
 use std::collections::HashMap;
 
 // ============================================================================
@@ -351,6 +351,8 @@ impl Memo {
         cost: Cost,
         property: Property,
     ) -> bool {
+        if property.partitioning != Partitioning::Any {
+        }
         if let Some(group) = self.groups.get_mut(&group_id) {
             if let Some(existing) = group.winners.get(&property) {
                 if !cost.is_less_than(&existing.cost) {

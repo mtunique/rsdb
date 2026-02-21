@@ -11,7 +11,7 @@
 
 use crate::cbo::{CBOContext, CostModel, Cost, PlanStats};
 use crate::memo::{ExprType, GroupExpression, Memo, PhysicalType};
-use crate::property::{Property, Statistics};
+use crate::property::Property;
 use crate::stats_derivation::{
     StatsDerivator, FilterStatsDerivator, JoinStatsDerivator, AggregateStatsDerivator, SimpleStatsDerivator
 };
@@ -1196,16 +1196,14 @@ impl CascadesOptimizer {
     }
 
     /// Main optimization entry point
-    pub fn optimize(&mut self, plan: LogicalPlan) -> Result<LogicalPlan> {
+    pub fn optimize(&mut self, plan: LogicalPlan, required_property: Property) -> Result<LogicalPlan> {
         let root_group_id = self.init_memo(&plan);
         self.memo.root_group_id = Some(root_group_id);
-
-        let required = Property::default();
 
         // Push initial task
         let mut task_stack: Vec<Task> = vec![Task::OptimizeGroup {
             group_id: root_group_id,
-            required_property: required.clone(),
+            required_property: required_property.clone(),
         }];
 
         let mut iterations = 0;
@@ -1283,7 +1281,7 @@ impl CascadesOptimizer {
             }
         }
 
-        self.extract_best_plan(root_group_id, &required)
+        self.extract_best_plan(root_group_id, &required_property)
     }
 
     /// OptimizeGroup: if winner exists, done. Otherwise push ExploreGroup + OptimizeExpression.
@@ -1357,14 +1355,16 @@ impl CascadesOptimizer {
         if let Some(expr) = self.memo.get_expr(expr_id) {
             if expr.is_physical() {
                 // For physical expressions, go straight to input optimization
-                task_stack.push(Task::OptimizeInput {
-                    group_id,
-                    expr_id,
-                    required_property: required_property.clone(),
-                    child_index: 0,
-                    accumulated_cost: Cost::zero(),
-                    child_properties: self.derive_child_properties(expr, required_property),
-                });
+                if let Some(child_props) = self.derive_child_properties(expr, required_property) {
+                    task_stack.push(Task::OptimizeInput {
+                        group_id,
+                        expr_id,
+                        required_property: required_property.clone(),
+                        child_index: 0,
+                        accumulated_cost: Cost::zero(),
+                        child_properties: child_props,
+                    });
+                }
                 return;
             }
 
@@ -1576,9 +1576,12 @@ impl CascadesOptimizer {
                 }
             }
 
-            // Update winner
-            self.memo
-                .update_winner(group_id, expr_id, total_cost, required_property.clone());
+            // Update winner only if this operator satisfies the required property
+            let output_property = self.derive_output_property(self.memo.get_expr(expr_id).unwrap(), child_properties);
+            if output_property.satisfies(required_property) {
+                self.memo
+                    .update_winner(group_id, expr_id, total_cost, required_property.clone());
+            }
             return;
         }
 
@@ -1726,7 +1729,7 @@ impl CascadesOptimizer {
         &self,
         expr: &GroupExpression,
         required_property: &Property,
-    ) -> Vec<Property> {
+    ) -> Option<Vec<Property>> {
         let mut props = vec![Property::default(); expr.children.len()];
 
         if let Some(phy_type) = expr.physical_type {
@@ -1734,28 +1737,45 @@ impl CascadesOptimizer {
                 PhysicalType::HashJoin => {
                     if let LogicalPlan::Join { join_condition, .. } = &expr.operator {
                         match join_condition {
-                            // Simple case: Hash Shuffle Join
-                            // Require Hash partitioning on join keys for both sides
                             JoinCondition::Using(cols) => {
                                 let hash_exprs: Vec<RsdbExpr> = cols.iter().map(|c| RsdbExpr::Column(c.clone())).collect();
                                 let prop = Property {
                                     partitioning: Partitioning::Hash(hash_exprs, 1),
                                     sorting: vec![],
                                 };
+                                if !prop.satisfies(required_property) { return None; }
                                 if props.len() >= 2 {
                                     props[0] = prop.clone();
                                     props[1] = prop;
                                 }
                             }
                             JoinCondition::On(expr) => {
-                                // TODO: Extract join keys from expression
-                                // For now, assume broadcast join (right side broadcast)
-                                // Left: Any, Right: Broadcast
-                                if props.len() >= 2 {
-                                    props[1] = Property {
-                                        partitioning: Partitioning::Broadcast,
+                                let (left_keys, right_keys) = extract_equi_join_keys(expr);
+                                if !left_keys.is_empty() && !right_keys.is_empty() {
+                                    let output_prop = Property {
+                                        partitioning: Partitioning::Hash(left_keys.clone(), 1),
                                         sorting: vec![],
                                     };
+                                    if !output_prop.satisfies(required_property) { return None; }
+
+                                    if props.len() >= 2 {
+                                        props[0] = Property {
+                                            partitioning: Partitioning::Hash(left_keys, 1),
+                                            sorting: vec![],
+                                        };
+                                        props[1] = Property {
+                                            partitioning: Partitioning::Hash(right_keys, 1),
+                                            sorting: vec![],
+                                        };
+                                    }
+                                } else {
+                                    if required_property.partitioning != Partitioning::Any { return None; }
+                                    if props.len() >= 2 {
+                                        props[1] = Property {
+                                            partitioning: Partitioning::Broadcast,
+                                            sorting: vec![],
+                                        };
+                                    }
                                 }
                             }
                             _ => {}
@@ -1769,15 +1789,16 @@ impl CascadesOptimizer {
                                 partitioning: Partitioning::Hash(group_expr.clone(), 1),
                                 sorting: vec![],
                             };
+                            if !prop.satisfies(required_property) { return None; }
                             if !props.is_empty() {
                                 props[0] = prop;
                             }
                         } else {
-                            // Global aggregation without groups -> Single partition
                             let prop = Property {
                                 partitioning: Partitioning::Single,
                                 sorting: vec![],
                             };
+                            if !prop.satisfies(required_property) { return None; }
                             if !props.is_empty() {
                                 props[0] = prop;
                             }
@@ -1785,35 +1806,96 @@ impl CascadesOptimizer {
                     }
                 }
                 PhysicalType::Exchange => {
-                    // Exchange itself satisfies the property, requires Any from child
-                    // props[0] is already Any
+                    if let LogicalPlan::Exchange { partitioning, .. } = &expr.operator {
+                        let prop = Property { partitioning: partitioning.clone(), sorting: vec![] };
+                        if !prop.satisfies(required_property) { return None; }
+                    }
                 }
-                PhysicalType::Sort => {
-                    // Sort creates order, requires Any distribution (or Single if global sort)
-                    // If Sort is global, child must be Single? Or we gather after sort?
-                    // For now, simple local sort
+                PhysicalType::Sort | PhysicalType::Limit => {
+                    if !props.is_empty() {
+                        props[0] = Property {
+                            partitioning: Partitioning::Single,
+                            sorting: vec![],
+                        };
+                    }
+                }
+                PhysicalType::Filter | PhysicalType::Project => {
+                    if required_property.partitioning != Partitioning::Any {
+                        if !props.is_empty() {
+                            props[0] = required_property.clone();
+                        }
+                    }
                 }
                 _ => {}
             }
         }
         
-        // Pass through partitioning if operator doesn't change it (e.g. Filter, Project)
-        // AND if it's not a blocking operator.
-        // Simplified: if required_property is Hash, Filter/Project pass it down.
-        if required_property.partitioning != Partitioning::Any {
-             if let Some(phy_type) = expr.physical_type {
-                 match phy_type {
-                     PhysicalType::Filter | PhysicalType::Project | PhysicalType::Limit => {
-                         if !props.is_empty() {
-                             props[0] = required_property.clone();
-                         }
-                     }
-                     _ => {}
-                 }
-             }
-        }
+        Some(props)
+    }
 
-        props
+    fn derive_output_property(
+        &self,
+        expr: &GroupExpression,
+        input_properties: &[Property],
+    ) -> Property {
+        if let Some(phy_type) = expr.physical_type {
+            match phy_type {
+                PhysicalType::HashJoin => {
+                    if let LogicalPlan::Join { join_condition, .. } = &expr.operator {
+                        match join_condition {
+                            JoinCondition::On(e) => {
+                                let (left_keys, _) = extract_equi_join_keys(e);
+                                if !left_keys.is_empty() {
+                                    return Property {
+                                        partitioning: Partitioning::Hash(left_keys, 1),
+                                        sorting: vec![],
+                                    };
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                PhysicalType::Aggregate => {
+                    if let LogicalPlan::Aggregate { group_expr, .. } = &expr.operator {
+                        if !group_expr.is_empty() {
+                            return Property {
+                                partitioning: Partitioning::Hash(group_expr.clone(), 1),
+                                sorting: vec![],
+                            };
+                        } else {
+                            return Property {
+                                partitioning: Partitioning::Single,
+                                sorting: vec![],
+                            };
+                        }
+                    }
+                }
+                PhysicalType::Exchange => {
+                    if let LogicalPlan::Exchange { partitioning, .. } = &expr.operator {
+                        return Property {
+                            partitioning: partitioning.clone(),
+                            sorting: vec![],
+                        };
+                    }
+                }
+                PhysicalType::Project | PhysicalType::Filter | PhysicalType::Limit => {
+                    if !input_properties.is_empty() {
+                        return input_properties[0].clone();
+                    }
+                }
+                PhysicalType::Sort => {
+                    if !input_properties.is_empty() {
+                        return input_properties[0].clone();
+                    }
+                }
+                PhysicalType::TableScan => {
+                    return Property::default();
+                }
+                _ => {}
+            }
+        }
+        Property::default()
     }
 
     /// Compute the local cost of an operator (not including children)
@@ -1879,7 +1961,7 @@ impl CascadesOptimizer {
         
         let mut child_plans = Vec::new();
         for (i, &child_gid) in expr.children.iter().enumerate() {
-            let req = child_props.get(i).cloned().unwrap_or_default();
+            let req = child_props.as_ref().and_then(|p| p.get(i)).cloned().unwrap_or_default();
             child_plans.push(self.extract_best_plan(child_gid, &req)?);
         }
 
@@ -2207,7 +2289,11 @@ pub fn has_joins(plan: &LogicalPlan) -> bool {
         | LogicalPlan::Aggregate { input, .. }
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Limit { input, .. }
-        | LogicalPlan::Subquery { query: input, .. } => has_joins(input),
+        | LogicalPlan::Subquery { query: input, .. }
+        | LogicalPlan::SubqueryAlias { input, .. }
+        | LogicalPlan::Explain { input }
+        | LogicalPlan::Exchange { input, .. }
+        | LogicalPlan::RemoteExchange { input, .. } => has_joins(input),
         LogicalPlan::Union { inputs, .. } => inputs.iter().any(has_joins),
         _ => false,
     }
@@ -2274,6 +2360,32 @@ impl UnionFind {
     pub fn is_connected(&self, a: &str, b: &str) -> bool {
         self.find(a) == self.find(b)
     }
+}
+
+/// Helper to extract equi-join keys from a join condition expression.
+/// Returns (left_keys, right_keys).
+fn extract_equi_join_keys(expr: &RsdbExpr) -> (Vec<RsdbExpr>, Vec<RsdbExpr>) {
+    let mut left_keys = vec![];
+    let mut right_keys = vec![];
+    
+    let mut stack = vec![expr];
+    while let Some(e) = stack.pop() {
+        match e {
+            RsdbExpr::BinaryOp { left, op: BinaryOperator::Eq, right } => {
+                // Heuristic: left side of Eq is from left table, right from right table.
+                // In a real optimizer we check schema/column binding.
+                // Assuming standard form from PredicatePushdown.
+                left_keys.push(*left.clone());
+                right_keys.push(*right.clone());
+            }
+            RsdbExpr::BinaryOp { left, op: BinaryOperator::And, right } => {
+                stack.push(right);
+                stack.push(left);
+            }
+            _ => {}
+        }
+    }
+    (left_keys, right_keys)
 }
 
 // ============================================================================
@@ -2364,7 +2476,7 @@ mod tests {
     fn test_cascades_simple_scan() {
         let scan = make_scan("orders");
         let mut optimizer = CascadesOptimizer::new();
-        let result = optimizer.optimize(scan).unwrap();
+        let result = optimizer.optimize(scan, Property::default()).unwrap();
         assert!(matches!(result, LogicalPlan::Scan { .. }));
     }
 
@@ -2375,7 +2487,7 @@ mod tests {
         let join = make_join(a, b, "a_id", "b_id");
 
         let mut optimizer = CascadesOptimizer::new();
-        let result = optimizer.optimize(join).unwrap();
+        let result = optimizer.optimize(join, Property::default()).unwrap();
 
         // Should produce a valid plan (either original or commuted)
         match &result {
@@ -2396,7 +2508,7 @@ mod tests {
 
         let mut optimizer = CascadesOptimizer::new();
         optimizer.max_iterations = 5000;
-        let result = optimizer.optimize(abc).unwrap();
+        let result = optimizer.optimize(abc, Property::default()).unwrap();
 
         // Should produce a valid join plan
         match &result {

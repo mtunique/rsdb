@@ -867,7 +867,7 @@ impl CBOOptimizer {
         use super::CascadesOptimizer;
 
         let mut cascades = CascadesOptimizer::new_with_stats(&self.context);
-        let plan = cascades.optimize(plan)?;
+        let plan = cascades.optimize(plan, crate::property::Property::default())?;
 
         let optimizer = super::Optimizer::new();
         let optimized = optimizer.optimize(plan)?;

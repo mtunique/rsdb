@@ -20,7 +20,7 @@ use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::execution::TaskContext;
 use datafusion::common::{Result, DataFusionError};
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::{Stream, TryStreamExt};
 use tonic::transport::Channel;
 
 #[derive(Debug, Clone)]
@@ -32,7 +32,7 @@ pub struct PartitionLocation {
 /// A physical plan node that reads data from upstream workers via Arrow Flight.
 #[derive(Debug)]
 pub struct RemoteExchangeExec {
-    partitioning: Partitioning,
+    _partitioning: Partitioning,
     locations: Vec<Vec<PartitionLocation>>,
     schema: SchemaRef,
     metrics: ExecutionPlanMetricsSet,
@@ -59,7 +59,7 @@ impl RemoteExchangeExec {
         );
         
         Self {
-            partitioning,
+            _partitioning: partitioning,
             locations,
             schema,
             metrics: ExecutionPlanMetricsSet::new(),

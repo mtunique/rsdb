@@ -4,10 +4,9 @@
 //! distinct values, etc.) for logical operators bottom-up.
 //! Reference: ClickHouse CardinalityEstimator architecture.
 
-use crate::cbo::{CBOContext, ColumnStats, PlanStats};
+use crate::cbo::{CBOContext, PlanStats};
 use rsdb_sql::expr::{BinaryOperator, Expr as RsdbExpr, UnaryOperator};
 use rsdb_sql::logical_plan::{JoinCondition, JoinType, LogicalPlan};
-use std::collections::HashMap;
 
 /// Trait for deriving statistics for a logical plan node
 pub trait StatsDerivator {
@@ -218,5 +217,65 @@ fn find_join_keys(expr: &RsdbExpr) -> Option<(String, String)> {
             find_join_keys(left)
         }
         _ => None
+    }
+}
+
+/// Recursively derive statistics for a LogicalPlan
+pub fn derive_stats_recursive(plan: &LogicalPlan, cbo: &CBOContext) -> PlanStats {
+    match plan {
+        LogicalPlan::Scan { table_name, .. } => {
+            if let Some(stats) = cbo.get_table_stats(table_name) {
+                stats.clone()
+            } else {
+                PlanStats::default() // Or some default guess
+            }
+        }
+        LogicalPlan::Filter { input, predicate } => {
+            let input_stats = derive_stats_recursive(input, cbo);
+            let derivator = FilterStatsDerivator { predicate };
+            derivator.derive(&[&input_stats], cbo)
+        }
+        LogicalPlan::Join { left, right, join_type, join_condition, .. } => {
+            let left_stats = derive_stats_recursive(left, cbo);
+            let right_stats = derive_stats_recursive(right, cbo);
+            let derivator = JoinStatsDerivator { join_type: *join_type, condition: join_condition };
+            derivator.derive(&[&left_stats, &right_stats], cbo)
+        }
+        LogicalPlan::CrossJoin { left, right, .. } => {
+            let left_stats = derive_stats_recursive(left, cbo);
+            let right_stats = derive_stats_recursive(right, cbo);
+            let derivator = JoinStatsDerivator { join_type: JoinType::Cross, condition: &JoinCondition::None };
+            derivator.derive(&[&left_stats, &right_stats], cbo)
+        }
+        LogicalPlan::Aggregate { input, group_expr, .. } => {
+            let input_stats = derive_stats_recursive(input, cbo);
+            let derivator = AggregateStatsDerivator { group_expr };
+            derivator.derive(&[&input_stats], cbo)
+        }
+        LogicalPlan::Project { input, .. } => {
+            let input_stats = derive_stats_recursive(input, cbo);
+            // Project preserves cardinality
+            let derivator = SimpleStatsDerivator { limit: None };
+            derivator.derive(&[&input_stats], cbo)
+        }
+        LogicalPlan::Sort { input, .. } => {
+            let input_stats = derive_stats_recursive(input, cbo);
+            let derivator = SimpleStatsDerivator { limit: None };
+            derivator.derive(&[&input_stats], cbo)
+        }
+        LogicalPlan::Limit { input, limit, .. } => {
+            let input_stats = derive_stats_recursive(input, cbo);
+            let derivator = SimpleStatsDerivator { limit: Some(*limit) };
+            derivator.derive(&[&input_stats], cbo)
+        }
+        LogicalPlan::Exchange { input, .. } => {
+            derive_stats_recursive(input, cbo)
+        }
+        LogicalPlan::SubqueryAlias { input, .. } => {
+            derive_stats_recursive(input, cbo)
+        }
+        LogicalPlan::Explain { input } => derive_stats_recursive(input, cbo),
+        LogicalPlan::Subquery { query, .. } => derive_stats_recursive(query, cbo),
+        _ => PlanStats::default(),
     }
 }

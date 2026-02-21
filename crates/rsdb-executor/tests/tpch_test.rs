@@ -3,7 +3,7 @@ use rsdb_executor::DataFusionEngine;
 use rsdb_executor::ExecutionEngine;
 use rsdb_executor::tpch;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::time::{timeout, Duration, Instant};
 

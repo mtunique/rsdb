@@ -1,6 +1,5 @@
 use datafusion::prelude::CsvReadOptions;
 use rsdb_executor::DataFusionEngine;
-use rsdb_executor::ExecutionEngine;
 use rsdb_executor::tpch;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -72,7 +71,13 @@ ORDER BY
     o_orderdate;";
 
     let results = engine.execute_sql(sql).await.unwrap();
-    let plan = format!("{:?}", results[0]);
+    
+    // The result is a single string column containing the plan
+    let batch = &results[0];
+    let column = batch.column(0).as_any().downcast_ref::<datafusion::arrow::array::StringArray>().expect("Explain should return StringArray");
+    let plan = column.value(0);
+    
+    println!("\n=== OPTIMIZED Q03 PLAN WITH STATS ===\n{}\n=====================================\n", plan);
     
     println!("Validated Q03 Plan Structure");
     
@@ -89,6 +94,12 @@ ORDER BY
     assert!(plan.contains("revenue"), "Plan should correctly propagate output aliases");
     
     // 3. Join Structure
-    // Currently SqlPlanner produces CrossJoins for multi-table queries before CBO reordering
-    assert!(plan.contains("CrossJoin"), "Initial multi-table plan should use CrossJoin nodes");
+    // With Predicate Pushdown and CrossJoin conversion, we should see Inner Joins instead of CrossJoins
+    assert!(plan.contains("Join"), "Plan should contain Join nodes");
+    // CrossJoin should be gone or minimized (only for true cross products)
+    assert!(!plan.contains("CrossJoin"), "CrossJoins should be converted to Inner Joins with predicates");
+
+    // 4. Distribution (New)
+    // We added InsertExchange rule, so we should see explicit Exchange nodes
+    assert!(plan.contains("Exchange"), "Plan should contain Exchange nodes for distributed execution");
 }
