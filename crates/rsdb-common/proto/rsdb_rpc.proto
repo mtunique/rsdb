@@ -10,11 +10,24 @@ service CoordinatorControl {
 }
 
 service WorkerTask {
-  rpc ExecuteSql(ExecuteSqlRequest) returns (ExecuteSqlResponse);
-  rpc ExecutePlanFragment(ExecutePlanFragmentRequest) returns (ExecutePlanFragmentResponse);
-  rpc RegisterCsv(RegisterCsvRequest) returns (RegisterCsvResponse);
-  rpc RegisterParquet(RegisterParquetRequest) returns (RegisterParquetResponse);
-  rpc ListTables(ListTablesRequest) returns (ListTablesResponse);
+  // Execute a plan fragment and return a stream of Arrow batches.
+  // Can be used for root tasks (returning data) or intermediate tasks (registering for W2W).
+  rpc ExecutePlanFragmentStream (ExecutePlanFragmentRequest) returns (stream ArrowBatch);
+
+  // Register a CSV file as a table on the worker.
+  rpc RegisterCsv (RegisterCsvRequest) returns (RegisterCsvResponse);
+  
+  // Register a Parquet file as a table on the worker.
+  rpc RegisterParquet (RegisterParquetRequest) returns (RegisterParquetResponse);
+
+  // Register an in-memory table from Arrow IPC.
+  rpc RegisterMemTable (RegisterMemTableRequest) returns (RegisterMemTableResponse);
+
+  // Execute a raw SQL query (mostly for DDL/Utility).
+  rpc ExecuteSql (ExecuteSqlRequest) returns (ExecuteSqlResponse);
+
+  // List tables currently registered on the worker.
+  rpc ListTables (ListTablesRequest) returns (ListTablesResponse);
 }
 
 message RegisterWorkerRequest {
@@ -56,12 +69,33 @@ message ExecuteSqlResponse {
 message ExecutePlanFragmentRequest {
   // Substrait plan bytes (prost-encoded Plan)
   bytes plan_bytes = 1;
+  // Unique task identifier for W2W shuffle result registration
+  string task_id = 2;
+  // Whether to return the result stream in the RPC response.
+  bool return_data = 3;
+  // Physical data sources for remote exchanges within this fragment.
+  repeated RemoteSource sources = 4;
 }
 
-message ExecutePlanFragmentResponse {
-  // Arrow IPC stream bytes (StreamWriter format)
-  bytes arrow_ipc = 1;
+message RemoteSource {
+  string worker_addr = 1;
+  string task_id = 2;
+  // Serialized Arrow Schema for this data source
+  bytes schema_ipc = 3;
 }
+
+message ArrowBatch {
+  bytes arrow_ipc = 1;  // Single RecordBatch as Arrow IPC
+  bytes schema_ipc = 2; // Schema (optional metadata)
+}
+
+message RegisterMemTableRequest {
+  string table_name = 1;
+  // Arrow IPC stream bytes (StreamWriter format)
+  bytes arrow_ipc = 2;
+}
+
+message RegisterMemTableResponse {}
 
 message RegisterCsvRequest {
   string table_name = 1;

@@ -112,6 +112,13 @@ impl CoordinatorControl for CoordinatorControlService {
                     has_header: true,
                     delimiter: 0,
                 },
+                RegisteredTableSource::View { sql } => RegisteredTable {
+                    table_name: name,
+                    kind: "view".to_string(),
+                    path: sql,
+                    has_header: false,
+                    delimiter: 0,
+                },
             })
             .collect();
 

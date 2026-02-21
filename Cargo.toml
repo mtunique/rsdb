@@ -17,7 +17,7 @@ members = [
 # Arrow ecosystem - version 57 for latest compatibility
 arrow = "57"
 arrow-array = "57"
-arrow-schema = "57"
+arrow-schema = { version = "57", features = ["serde"] }
 arrow-flight = { version = "57", features = ["flight-sql-experimental"] }
 arrow-ipc = "57"
 
@@ -25,6 +25,7 @@ arrow-ipc = "57"
 datafusion = "52"
 datafusion-common = "52"
 datafusion-expr = "52"
+datafusion-physical-plan = "52"
 datafusion-substrait = "52"
 
 # Substrait for query plan serialization
@@ -57,6 +58,7 @@ anyhow = "1"
 # Serialization
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+serde_json = "1"
 
 # Utilities
 dashmap = "6"

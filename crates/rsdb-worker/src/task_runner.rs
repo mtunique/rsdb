@@ -21,10 +21,14 @@ impl TaskRunner {
         }
     }
 
-    /// Execute a fragment
-    pub async fn execute(&self, fragment_bytes: Vec<u8>) -> Result<Vec<RecordBatch>> {
+    /// Execute a fragment streaming
+    pub async fn execute_stream(
+        &self,
+        fragment_bytes: Vec<u8>,
+        sources: Vec<rsdb_common::rpc::RemoteSource>,
+    ) -> Result<datafusion::physical_plan::SendableRecordBatchStream> {
         if let Some(executor) = &self.executor {
-            executor.execute(&fragment_bytes).await
+            executor.execute_stream(&fragment_bytes, &sources).await
         } else {
             Err(rsdb_common::RsdbError::Worker(
                 "No executor configured".to_string(),

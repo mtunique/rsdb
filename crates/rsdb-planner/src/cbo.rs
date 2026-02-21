@@ -8,11 +8,74 @@
 //! - Cost model for join, scan, filter, aggregation
 //! - StatsProvider trait for pluggable statistics sources
 
-use crate::cascades::Cost;
 use rsdb_common::Result;
 use rsdb_sql::expr::Expr as RsdbExpr;
 use rsdb_sql::logical_plan::LogicalPlan;
 use std::collections::{HashMap, HashSet};
+
+// ============================================================================
+// Cost - Multi-dimensional
+// ============================================================================
+
+/// Multi-dimensional cost estimate
+#[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+pub struct Cost {
+    pub cpu: f64,
+    pub memory: f64,
+    pub network: f64,
+}
+
+impl Default for Cost {
+    fn default() -> Self {
+        Self::infinite()
+    }
+}
+
+impl Cost {
+    pub fn zero() -> Self {
+        Self {
+            cpu: 0.0,
+            memory: 0.0,
+            network: 0.0,
+        }
+    }
+
+    pub fn infinite() -> Self {
+        Self {
+            cpu: f64::INFINITY,
+            memory: f64::INFINITY,
+            network: f64::INFINITY,
+        }
+    }
+
+    pub fn new(cpu: f64, memory: f64, network: f64) -> Self {
+        Self {
+            cpu,
+            memory,
+            network,
+        }
+    }
+
+    pub fn total(&self) -> f64 {
+        self.cpu + 0.5 * self.memory + 2.0 * self.network
+    }
+
+    pub fn add(&self, other: &Cost) -> Self {
+        Self {
+            cpu: self.cpu + other.cpu,
+            memory: self.memory + other.memory,
+            network: self.network + other.network,
+        }
+    }
+
+    pub fn is_less_than(&self, other: &Cost) -> bool {
+        self.total() < other.total()
+    }
+
+    pub fn is_infinite(&self) -> bool {
+        self.cpu.is_infinite() || self.memory.is_infinite() || self.network.is_infinite()
+    }
+}
 
 // ============================================================================
 // Statistics Types
@@ -123,6 +186,9 @@ impl CostModel {
             }
             LogicalPlan::Aggregate { .. } => {
                 Cost::new(rows * self.aggregate_cost_per_row, rows * 8.0, 0.0)
+            }
+            LogicalPlan::Exchange { .. } => {
+                Cost::new(rows * 0.1, 0.0, rows * self.network_cost_per_row)
             }
             LogicalPlan::Limit { .. } => Cost::new(1.0, 0.0, 0.0),
             LogicalPlan::Union { .. } => Cost::new(rows * 0.1, 0.0, 0.0),
@@ -746,6 +812,16 @@ fn reorder_joins(plan: LogicalPlan, cbo: &CBOContext) -> Result<LogicalPlan> {
             Ok(LogicalPlan::Subquery {
                 query: new_query,
                 schema,
+            })
+        }
+        LogicalPlan::Exchange {
+            input,
+            partitioning,
+        } => {
+            let new_input = Box::new(reorder_joins(*input, cbo)?);
+            Ok(LogicalPlan::Exchange {
+                input: new_input,
+                partitioning,
             })
         }
         _ => Ok(plan),

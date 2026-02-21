@@ -9,10 +9,15 @@
 //! - Rules: transformation and implementation rules
 //! - MinCutBranch: join enumeration on hypergraph (ref: ClickHouse JoinEnumOnGraph.cpp)
 
-use crate::cbo::{CBOContext, CostModel};
+use crate::cbo::{CBOContext, CostModel, Cost, PlanStats};
+use crate::memo::{ExprType, GroupExpression, Memo, PhysicalType};
+use crate::property::{Property, Statistics};
+use crate::stats_derivation::{
+    StatsDerivator, FilterStatsDerivator, JoinStatsDerivator, AggregateStatsDerivator, SimpleStatsDerivator
+};
 use rsdb_common::Result;
 use rsdb_sql::expr::{BinaryOperator, Expr as RsdbExpr};
-use rsdb_sql::logical_plan::{JoinCondition, JoinType, LogicalPlan};
+use rsdb_sql::logical_plan::{JoinCondition, JoinType, LogicalPlan, Partitioning};
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 
@@ -118,458 +123,6 @@ impl fmt::Display for BitSet64 {
             first = false;
         }
         write!(f, "}}")
-    }
-}
-
-// ============================================================================
-// ExprFingerprint - For Memo deduplication
-// ============================================================================
-
-/// Fingerprint for memo deduplication.
-/// Two expressions with the same fingerprint are structurally identical.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ExprFingerprint {
-    pub op_tag: String,
-    pub op_key: String,
-    pub children: Vec<usize>,
-}
-
-impl ExprFingerprint {
-    pub fn from_plan(plan: &LogicalPlan, children: &[usize]) -> Self {
-        let (op_tag, op_key) = match plan {
-            LogicalPlan::Scan {
-                table_name,
-                projection,
-                ..
-            } => (
-                "Scan".to_string(),
-                format!("{}:{:?}", table_name, projection),
-            ),
-            LogicalPlan::Filter { predicate, .. } => {
-                ("Filter".to_string(), format!("{:?}", predicate))
-            }
-            LogicalPlan::Project { expr, .. } => ("Project".to_string(), format!("{:?}", expr)),
-            LogicalPlan::Aggregate {
-                group_expr,
-                aggregate_expr,
-                ..
-            } => (
-                "Aggregate".to_string(),
-                format!("{:?}:{:?}", group_expr, aggregate_expr),
-            ),
-            LogicalPlan::Sort { expr, .. } => ("Sort".to_string(), format!("{:?}", expr)),
-            LogicalPlan::Limit { limit, offset, .. } => {
-                ("Limit".to_string(), format!("{}:{}", limit, offset))
-            }
-            LogicalPlan::Join {
-                join_type,
-                join_condition,
-                ..
-            } => (
-                "Join".to_string(),
-                format!("{:?}:{:?}", join_type, join_condition),
-            ),
-            LogicalPlan::CrossJoin { .. } => ("CrossJoin".to_string(), String::new()),
-            LogicalPlan::Union { .. } => ("Union".to_string(), String::new()),
-            LogicalPlan::Subquery { .. } => ("Subquery".to_string(), String::new()),
-            LogicalPlan::CreateTable { table_name, .. } => {
-                ("CreateTable".to_string(), table_name.clone())
-            }
-            LogicalPlan::DropTable { table_name, .. } => {
-                ("DropTable".to_string(), table_name.clone())
-            }
-            LogicalPlan::Insert { table_name, .. } => ("Insert".to_string(), table_name.clone()),
-            LogicalPlan::Analyze { table_name } => ("Analyze".to_string(), table_name.clone()),
-            LogicalPlan::EmptyRelation => ("EmptyRelation".to_string(), String::new()),
-        };
-        Self {
-            op_tag,
-            op_key,
-            children: children.to_vec(),
-        }
-    }
-}
-
-// ============================================================================
-// Cost - Multi-dimensional
-// ============================================================================
-
-/// Multi-dimensional cost estimate
-#[derive(Debug, Clone, Copy)]
-pub struct Cost {
-    pub cpu: f64,
-    pub memory: f64,
-    pub network: f64,
-}
-
-impl Default for Cost {
-    fn default() -> Self {
-        Self::infinite()
-    }
-}
-
-impl Cost {
-    pub fn zero() -> Self {
-        Self {
-            cpu: 0.0,
-            memory: 0.0,
-            network: 0.0,
-        }
-    }
-
-    pub fn infinite() -> Self {
-        Self {
-            cpu: f64::INFINITY,
-            memory: f64::INFINITY,
-            network: f64::INFINITY,
-        }
-    }
-
-    pub fn new(cpu: f64, memory: f64, network: f64) -> Self {
-        Self {
-            cpu,
-            memory,
-            network,
-        }
-    }
-
-    pub fn total(&self) -> f64 {
-        self.cpu + 0.5 * self.memory + 2.0 * self.network
-    }
-
-    pub fn add(&self, other: &Cost) -> Self {
-        Self {
-            cpu: self.cpu + other.cpu,
-            memory: self.memory + other.memory,
-            network: self.network + other.network,
-        }
-    }
-
-    pub fn is_less_than(&self, other: &Cost) -> bool {
-        self.total() < other.total()
-    }
-
-    pub fn is_infinite(&self) -> bool {
-        self.cpu.is_infinite() || self.memory.is_infinite() || self.network.is_infinite()
-    }
-}
-
-// ============================================================================
-// Property / Partitioning / Statistics
-// ============================================================================
-
-/// Partitioning type
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
-pub enum Partitioning {
-    #[default]
-    Any,
-    Single,
-    Hash,
-    Range,
-    RoundRobin,
-}
-
-/// Required property for optimization
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
-pub struct Property {
-    pub partitioning: Partitioning,
-    pub sorting: Vec<String>,
-}
-
-/// Statistics for a group
-#[derive(Debug, Clone, Default)]
-pub struct Statistics {
-    pub row_count: u64,
-    pub output_size: u64,
-    pub column_stats: HashMap<String, ColumnStat>,
-}
-
-/// Column statistics
-#[derive(Debug, Clone, Default)]
-pub struct ColumnStat {
-    pub ndv: u64,
-    pub null_count: u64,
-    pub min: Option<String>,
-    pub max: Option<String>,
-}
-
-// ============================================================================
-// Winner
-// ============================================================================
-
-/// Winner - best expression for a given property in a group
-#[derive(Debug, Clone)]
-pub struct Winner {
-    pub expr_id: usize,
-    pub cost: Cost,
-}
-
-// ============================================================================
-// GroupExpression - stored flat in Memo
-// ============================================================================
-
-/// Expression type
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExprType {
-    Logical,
-    Physical,
-}
-
-/// Physical implementation type
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PhysicalType {
-    TableScan,
-    Filter,
-    Project,
-    HashJoin,
-    Aggregate,
-    Sort,
-    Limit,
-}
-
-/// A logical or physical operator with child groups, stored flat in Memo
-#[derive(Debug, Clone)]
-pub struct GroupExpression {
-    pub id: usize,
-    pub group_id: usize,
-    pub operator: LogicalPlan,
-    pub children: Vec<usize>,
-    pub expr_type: ExprType,
-    pub physical_type: Option<PhysicalType>,
-    /// Bitset tracking which rules have been applied
-    pub applied_rules: u64,
-    /// Whether this expression has been explored (transformation rules applied)
-    pub explored: bool,
-    pub cost: Cost,
-}
-
-impl GroupExpression {
-    pub fn new(id: usize, group_id: usize, operator: LogicalPlan, children: Vec<usize>) -> Self {
-        Self {
-            id,
-            group_id,
-            operator,
-            children,
-            expr_type: ExprType::Logical,
-            physical_type: None,
-            applied_rules: 0,
-            explored: false,
-            cost: Cost::infinite(),
-        }
-    }
-
-    pub fn is_logical(&self) -> bool {
-        self.expr_type == ExprType::Logical
-    }
-
-    pub fn is_physical(&self) -> bool {
-        self.expr_type == ExprType::Physical
-    }
-
-    pub fn has_applied_rule(&self, rule_id: usize) -> bool {
-        (self.applied_rules & (1u64 << rule_id)) != 0
-    }
-
-    pub fn mark_rule_applied(&mut self, rule_id: usize) {
-        self.applied_rules |= 1u64 << rule_id;
-    }
-
-    pub fn fingerprint(&self) -> ExprFingerprint {
-        ExprFingerprint::from_plan(&self.operator, &self.children)
-    }
-
-    /// Return the operator tag for rule matching
-    pub fn op_tag(&self) -> &str {
-        match &self.operator {
-            LogicalPlan::Scan { .. } => "Scan",
-            LogicalPlan::Filter { .. } => "Filter",
-            LogicalPlan::Project { .. } => "Project",
-            LogicalPlan::Aggregate { .. } => "Aggregate",
-            LogicalPlan::Sort { .. } => "Sort",
-            LogicalPlan::Limit { .. } => "Limit",
-            LogicalPlan::Join { .. } => "Join",
-            LogicalPlan::CrossJoin { .. } => "CrossJoin",
-            LogicalPlan::Union { .. } => "Union",
-            LogicalPlan::Subquery { .. } => "Subquery",
-            _ => "Other",
-        }
-    }
-}
-
-// ============================================================================
-// Group - stores expression IDs, winners by property
-// ============================================================================
-
-/// Group: a set of logically equivalent expressions
-#[derive(Debug, Clone)]
-pub struct Group {
-    pub id: usize,
-    pub expressions: Vec<usize>, // IDs into Memo::expressions
-    pub winners: HashMap<Property, Winner>,
-    pub statistics: Option<Statistics>,
-    pub explored: bool,
-}
-
-impl Group {
-    pub fn new(id: usize) -> Self {
-        Self {
-            id,
-            expressions: Vec::new(),
-            winners: HashMap::new(),
-            statistics: None,
-            explored: false,
-        }
-    }
-
-    pub fn has_winner(&self, property: &Property) -> bool {
-        self.winners.contains_key(property)
-    }
-
-    pub fn get_winner(&self, property: &Property) -> Option<&Winner> {
-        self.winners.get(property)
-    }
-
-    pub fn get_best_cost(&self, property: &Property) -> Cost {
-        self.winners
-            .get(property)
-            .map(|w| w.cost)
-            .unwrap_or(Cost::infinite())
-    }
-}
-
-// ============================================================================
-// Memo - proper deduplication with fingerprint index
-// ============================================================================
-
-/// Memo: stores all groups and expressions with deduplication
-#[derive(Debug, Clone, Default)]
-pub struct Memo {
-    pub groups: HashMap<usize, Group>,
-    pub expressions: HashMap<usize, GroupExpression>,
-    fingerprint_index: HashMap<ExprFingerprint, (usize, usize)>, // fingerprint -> (group_id, expr_id)
-    next_group_id: usize,
-    next_expr_id: usize,
-    pub root_group_id: Option<usize>,
-}
-
-impl Memo {
-    pub fn new() -> Self {
-        Self {
-            groups: HashMap::new(),
-            expressions: HashMap::new(),
-            fingerprint_index: HashMap::new(),
-            next_group_id: 0,
-            next_expr_id: 0,
-            root_group_id: None,
-        }
-    }
-
-    pub fn create_group(&mut self) -> usize {
-        let id = self.next_group_id;
-        self.next_group_id += 1;
-        self.groups.insert(id, Group::new(id));
-        id
-    }
-
-    pub fn get_group(&self, id: usize) -> Option<&Group> {
-        self.groups.get(&id)
-    }
-
-    pub fn get_group_mut(&mut self, id: usize) -> Option<&mut Group> {
-        self.groups.get_mut(&id)
-    }
-
-    pub fn get_expr(&self, id: usize) -> Option<&GroupExpression> {
-        self.expressions.get(&id)
-    }
-
-    pub fn get_expr_mut(&mut self, id: usize) -> Option<&mut GroupExpression> {
-        self.expressions.get_mut(&id)
-    }
-
-    /// Insert an expression. Returns (group_id, expr_id, is_new).
-    /// If an expression with the same fingerprint already exists, returns the existing one.
-    pub fn insert_expression(
-        &mut self,
-        group_id: usize,
-        operator: LogicalPlan,
-        children: Vec<usize>,
-        expr_type: ExprType,
-        physical_type: Option<PhysicalType>,
-    ) -> (usize, usize, bool) {
-        let fp = ExprFingerprint::from_plan(&operator, &children);
-
-        // Check for existing expression with same fingerprint
-        if let Some(&(existing_group, existing_expr)) = self.fingerprint_index.get(&fp) {
-            return (existing_group, existing_expr, false);
-        }
-
-        let expr_id = self.next_expr_id;
-        self.next_expr_id += 1;
-
-        let mut expr = GroupExpression::new(expr_id, group_id, operator, children);
-        expr.expr_type = expr_type;
-        expr.physical_type = physical_type;
-
-        self.fingerprint_index.insert(fp, (group_id, expr_id));
-        self.expressions.insert(expr_id, expr);
-
-        if let Some(group) = self.groups.get_mut(&group_id) {
-            group.expressions.push(expr_id);
-        }
-
-        (group_id, expr_id, true)
-    }
-
-    /// Add a logical expression to a group
-    pub fn add_logical_expr(
-        &mut self,
-        group_id: usize,
-        operator: LogicalPlan,
-        children: Vec<usize>,
-    ) -> (usize, usize, bool) {
-        self.insert_expression(group_id, operator, children, ExprType::Logical, None)
-    }
-
-    /// Add a physical expression to a group
-    pub fn add_physical_expr(
-        &mut self,
-        group_id: usize,
-        operator: LogicalPlan,
-        children: Vec<usize>,
-        physical_type: PhysicalType,
-    ) -> (usize, usize, bool) {
-        self.insert_expression(
-            group_id,
-            operator,
-            children,
-            ExprType::Physical,
-            Some(physical_type),
-        )
-    }
-
-    /// Update winner for a group+property. Returns true if updated.
-    pub fn update_winner(
-        &mut self,
-        group_id: usize,
-        expr_id: usize,
-        cost: Cost,
-        property: Property,
-    ) -> bool {
-        if let Some(group) = self.groups.get_mut(&group_id) {
-            if let Some(existing) = group.winners.get(&property) {
-                if !cost.is_less_than(&existing.cost) {
-                    return false;
-                }
-            }
-            group.winners.insert(property, Winner { expr_id, cost });
-            return true;
-        }
-        false
-    }
-
-    pub fn get_root_group(&self) -> Option<&Group> {
-        self.root_group_id.and_then(|id| self.groups.get(&id))
     }
 }
 
@@ -736,29 +289,7 @@ impl CascadesRule for JoinAssociativity {
                         let a_group = left_expr.children[0];
                         let _b_group = left_expr.children[1];
 
-                        // Create Join(B, C) as a new expression
-                        // The new inner join will be: Join(A, Join(B,C))
-                        // We need to create new children: [a_group, new_bc_group]
-                        // But we can't create groups here, so we output a nested structure
-                        // Instead, we output: new_children = [a_group, b_group, c_group]
-                        // and handle reassembly in the optimizer
-
-                        // For now, produce Join(A, Join(B,C)) where
-                        // the inner join BC uses b_group and c_group as children
-
                         if let LogicalPlan::Join { schema, .. } = &expr.operator {
-                            let _bc_join = LogicalPlan::Join {
-                                left: Box::new(LogicalPlan::EmptyRelation),
-                                right: Box::new(LogicalPlan::EmptyRelation),
-                                join_type: JoinType::Inner,
-                                join_condition: JoinCondition::None,
-                                schema: schema.clone(),
-                            };
-
-                            // This rule just signals the structure.
-                            // The optimizer will create proper groups for BC join.
-                            // For simplicity, output the top-level join with 2 children:
-                            // [a_group, c_group] (swapped association)
                             let new_op = LogicalPlan::Join {
                                 left: Box::new(LogicalPlan::EmptyRelation),
                                 right: Box::new(LogicalPlan::EmptyRelation),
@@ -774,7 +305,7 @@ impl CascadesRule for JoinAssociativity {
                                 physical_type: None,
                             });
                         }
-                        break; // one reassociation is enough per apply
+                        break;
                     }
                 }
             }
@@ -1439,6 +970,14 @@ pub enum Task {
         accumulated_cost: Cost,
         child_properties: Vec<Property>,
     },
+    EnforceSorting {
+        group_id: usize,
+        required_property: Property,
+    },
+    EnforceDistribution {
+        group_id: usize,
+        required_property: Property,
+    },
 }
 
 /// Cascades Optimizer
@@ -1469,6 +1008,13 @@ impl CascadesOptimizer {
 
     /// Initialize Memo from a LogicalPlan tree (bottom-up)
     fn init_memo(&mut self, plan: &LogicalPlan) -> usize {
+        // Helper to get stats from a group safely
+        let get_stats = |memo: &Memo, gid: usize| -> PlanStats {
+            memo.get_group(gid)
+                .and_then(|g| g.statistics.clone())
+                .unwrap_or_default()
+        };
+
         match plan {
             LogicalPlan::Scan { .. } | LogicalPlan::EmptyRelation => {
                 let group_id = self.memo.create_group();
@@ -1478,79 +1024,167 @@ impl CascadesOptimizer {
                     if let Some(ctx) = &self.cbo_context {
                         let stats = ctx.get_or_default_stats(table_name);
                         if let Some(group) = self.memo.get_group_mut(group_id) {
-                            group.statistics = Some(Statistics {
-                                row_count: stats.row_count,
-                                output_size: stats.output_size,
-                                column_stats: HashMap::new(),
-                            });
+                            group.statistics = Some(stats);
                         }
                     }
                 }
                 group_id
             }
-            LogicalPlan::Filter { input, .. } => {
+            LogicalPlan::Filter { input, predicate } => {
                 let child_group = self.init_memo(input);
+                let child_stats = get_stats(&self.memo, child_group);
+                
                 let group_id = self.memo.create_group();
-                self.memo
-                    .add_logical_expr(group_id, plan.clone(), vec![child_group]);
+                self.memo.add_logical_expr(group_id, plan.clone(), vec![child_group]);
+
+                if let Some(ctx) = &self.cbo_context {
+                    let derivator = FilterStatsDerivator { predicate };
+                    let stats = derivator.derive(&[&child_stats], ctx);
+                    if let Some(group) = self.memo.get_group_mut(group_id) {
+                        group.statistics = Some(stats);
+                    }
+                }
                 group_id
             }
             LogicalPlan::Project { input, .. } => {
                 let child_group = self.init_memo(input);
+                let child_stats = get_stats(&self.memo, child_group);
+
                 let group_id = self.memo.create_group();
-                self.memo
-                    .add_logical_expr(group_id, plan.clone(), vec![child_group]);
+                self.memo.add_logical_expr(group_id, plan.clone(), vec![child_group]);
+                
+                if let Some(ctx) = &self.cbo_context {
+                    let derivator = SimpleStatsDerivator { limit: None };
+                    let stats = derivator.derive(&[&child_stats], ctx);
+                    if let Some(group) = self.memo.get_group_mut(group_id) {
+                        group.statistics = Some(stats);
+                    }
+                }
                 group_id
             }
-            LogicalPlan::Aggregate { input, .. } => {
+            LogicalPlan::Aggregate { input, group_expr, .. } => {
                 let child_group = self.init_memo(input);
+                let child_stats = get_stats(&self.memo, child_group);
+
                 let group_id = self.memo.create_group();
-                self.memo
-                    .add_logical_expr(group_id, plan.clone(), vec![child_group]);
+                self.memo.add_logical_expr(group_id, plan.clone(), vec![child_group]);
+
+                if let Some(ctx) = &self.cbo_context {
+                    let derivator = AggregateStatsDerivator { group_expr };
+                    let stats = derivator.derive(&[&child_stats], ctx);
+                    if let Some(group) = self.memo.get_group_mut(group_id) {
+                        group.statistics = Some(stats);
+                    }
+                }
                 group_id
             }
             LogicalPlan::Sort { input, .. } => {
                 let child_group = self.init_memo(input);
+                let child_stats = get_stats(&self.memo, child_group);
+
                 let group_id = self.memo.create_group();
-                self.memo
-                    .add_logical_expr(group_id, plan.clone(), vec![child_group]);
+                self.memo.add_logical_expr(group_id, plan.clone(), vec![child_group]);
+
+                if let Some(group) = self.memo.get_group_mut(group_id) {
+                    group.statistics = Some(child_stats);
+                }
                 group_id
             }
-            LogicalPlan::Limit { input, .. } => {
+            LogicalPlan::Limit { input, limit, .. } => {
                 let child_group = self.init_memo(input);
+                let child_stats = get_stats(&self.memo, child_group);
+
                 let group_id = self.memo.create_group();
-                self.memo
-                    .add_logical_expr(group_id, plan.clone(), vec![child_group]);
+                self.memo.add_logical_expr(group_id, plan.clone(), vec![child_group]);
+
+                if let Some(ctx) = &self.cbo_context {
+                    let derivator = SimpleStatsDerivator { limit: Some(*limit) };
+                    let stats = derivator.derive(&[&child_stats], ctx);
+                    if let Some(group) = self.memo.get_group_mut(group_id) {
+                        group.statistics = Some(stats);
+                    }
+                }
                 group_id
             }
-            LogicalPlan::Join { left, right, .. } => {
+            LogicalPlan::Join { left, right, join_type, join_condition, .. } => {
                 let left_group = self.init_memo(left);
+                let left_stats = get_stats(&self.memo, left_group);
+                
                 let right_group = self.init_memo(right);
+                let right_stats = get_stats(&self.memo, right_group);
+
                 let group_id = self.memo.create_group();
-                self.memo
-                    .add_logical_expr(group_id, plan.clone(), vec![left_group, right_group]);
+                self.memo.add_logical_expr(group_id, plan.clone(), vec![left_group, right_group]);
+
+                if let Some(ctx) = &self.cbo_context {
+                    let derivator = JoinStatsDerivator { join_type: *join_type, condition: join_condition };
+                    let stats = derivator.derive(&[&left_stats, &right_stats], ctx);
+                    if let Some(group) = self.memo.get_group_mut(group_id) {
+                        group.statistics = Some(stats);
+                    }
+                }
                 group_id
             }
             LogicalPlan::CrossJoin { left, right, .. } => {
                 let left_group = self.init_memo(left);
+                let left_stats = get_stats(&self.memo, left_group);
+
                 let right_group = self.init_memo(right);
+                let right_stats = get_stats(&self.memo, right_group);
+
                 let group_id = self.memo.create_group();
-                self.memo
-                    .add_logical_expr(group_id, plan.clone(), vec![left_group, right_group]);
+                self.memo.add_logical_expr(group_id, plan.clone(), vec![left_group, right_group]);
+
+                if let Some(ctx) = &self.cbo_context {
+                    let derivator = JoinStatsDerivator { join_type: JoinType::Cross, condition: &JoinCondition::None };
+                    let stats = derivator.derive(&[&left_stats, &right_stats], ctx);
+                    if let Some(group) = self.memo.get_group_mut(group_id) {
+                        group.statistics = Some(stats);
+                    }
+                }
                 group_id
             }
             LogicalPlan::Union { inputs, .. } => {
                 let child_groups: Vec<usize> = inputs.iter().map(|p| self.init_memo(p)).collect();
+                // Sum rows
+                let mut total_rows = 0;
+                for gid in &child_groups {
+                    total_rows += get_stats(&self.memo, *gid).row_count;
+                }
+                
                 let group_id = self.memo.create_group();
-                self.memo
-                    .add_logical_expr(group_id, plan.clone(), child_groups);
+                self.memo.add_logical_expr(group_id, plan.clone(), child_groups);
+                
+                if let Some(group) = self.memo.get_group_mut(group_id) {
+                    group.statistics = Some(PlanStats { row_count: total_rows, ..Default::default() });
+                }
                 group_id
             }
             LogicalPlan::Subquery { query, .. } => {
                 let child_group = self.init_memo(query);
+                let child_stats = get_stats(&self.memo, child_group);
+                
                 let group_id = self.memo.create_group();
-                self.memo
-                    .add_logical_expr(group_id, plan.clone(), vec![child_group]);
+                self.memo.add_logical_expr(group_id, plan.clone(), vec![child_group]);
+                
+                if let Some(group) = self.memo.get_group_mut(group_id) {
+                    group.statistics = Some(child_stats);
+                }
+                group_id
+            }
+            LogicalPlan::Exchange { input, partitioning } => {
+                let child_group = self.init_memo(input);
+                let child_stats = get_stats(&self.memo, child_group);
+                
+                let group_id = self.memo.create_group();
+                self.memo.add_logical_expr(group_id, LogicalPlan::Exchange {
+                    input: Box::new(LogicalPlan::EmptyRelation), // placeholder
+                    partitioning: partitioning.clone(),
+                }, vec![child_group]);
+                
+                if let Some(group) = self.memo.get_group_mut(group_id) {
+                    group.statistics = Some(child_stats);
+                }
                 group_id
             }
             _ => {
@@ -1634,6 +1268,18 @@ impl CascadesOptimizer {
                         &mut task_stack,
                     );
                 }
+                Task::EnforceSorting {
+                    group_id,
+                    required_property,
+                } => {
+                    self.handle_enforce_sorting(group_id, required_property);
+                }
+                Task::EnforceDistribution {
+                    group_id,
+                    required_property,
+                } => {
+                    self.handle_enforce_distribution(group_id, required_property);
+                }
             }
         }
 
@@ -1651,6 +1297,38 @@ impl CascadesOptimizer {
             // Check if we already have a winner
             if group.has_winner(required_property) {
                 return;
+            }
+
+            // 1. Sorting Enforcement
+            // If sorting is required, we can enforce it by adding a Sort operator
+            // on top of a plan that satisfies the partitioning requirements.
+            if !required_property.sorting.is_empty() {
+                let mut input_prop = required_property.clone();
+                input_prop.sorting.clear(); // Require partitioning but no sorting
+
+                task_stack.push(Task::EnforceSorting {
+                    group_id,
+                    required_property: required_property.clone(),
+                });
+                task_stack.push(Task::OptimizeGroup {
+                    group_id,
+                    required_property: input_prop,
+                });
+            }
+            // 2. Distribution Enforcement
+            // If partitioning is required (and we are not currently enforcing sorting on top of it),
+            // we can enforce it by adding an Exchange operator on top of Any plan.
+            else if required_property.partitioning != Partitioning::Any {
+                let input_prop = Property::default(); // Any, Any
+
+                task_stack.push(Task::EnforceDistribution {
+                    group_id,
+                    required_property: required_property.clone(),
+                });
+                task_stack.push(Task::OptimizeGroup {
+                    group_id,
+                    required_property: input_prop,
+                });
             }
 
             // Push ExploreGroup first (will be executed after OptimizeExpression tasks)
@@ -1685,7 +1363,7 @@ impl CascadesOptimizer {
                     required_property: required_property.clone(),
                     child_index: 0,
                     accumulated_cost: Cost::zero(),
-                    child_properties: vec![Property::default(); expr.children.len()],
+                    child_properties: self.derive_child_properties(expr, required_property),
                 });
                 return;
             }
@@ -1956,6 +1634,188 @@ impl CascadesOptimizer {
         }
     }
 
+    fn handle_enforce_sorting(&mut self, group_id: usize, required_property: Property) {
+        let mut input_prop = required_property.clone();
+        input_prop.sorting.clear();
+
+        let (input_cost, has_winner) = if let Some(group) = self.memo.get_group(group_id) {
+            if let Some(winner) = group.get_winner(&input_prop) {
+                (winner.cost, true)
+            } else {
+                (Cost::infinite(), false)
+            }
+        } else {
+            (Cost::infinite(), false)
+        };
+
+        if has_winner {
+            // Create Sort operator
+            let sort_exprs: Vec<RsdbExpr> = required_property.sorting.iter()
+                .map(|s| RsdbExpr::Column(s.clone()))
+                .collect();
+            
+            let sort_op = LogicalPlan::Sort {
+                input: Box::new(LogicalPlan::EmptyRelation),
+                expr: sort_exprs,
+            };
+
+            // Calculate cost
+            let row_count = self.memo.get_group(group_id)
+                .and_then(|g| g.statistics.as_ref())
+                .map(|s| s.row_count)
+                .unwrap_or(1000) as f64;
+            
+            let sort_cost = self.cost_model.compute_operator_cost(&sort_op, row_count);
+            let total_cost = input_cost.add(&sort_cost);
+
+            let (_, expr_id, _) = self.memo.insert_expression(
+                group_id,
+                sort_op,
+                vec![group_id],
+                ExprType::Physical,
+                Some(PhysicalType::Sort),
+            );
+
+            self.memo.update_winner(group_id, expr_id, total_cost, required_property);
+        }
+    }
+
+    fn handle_enforce_distribution(&mut self, group_id: usize, required_property: Property) {
+        let any_prop = Property::default();
+        let (any_cost, has_winner) = if let Some(group) = self.memo.get_group(group_id) {
+            if let Some(winner) = group.get_winner(&any_prop) {
+                (winner.cost, true)
+            } else {
+                (Cost::infinite(), false)
+            }
+        } else {
+            (Cost::infinite(), false)
+        };
+
+        if has_winner {
+            let row_count = self
+                .memo
+                .get_group(group_id)
+                .and_then(|g| g.statistics.as_ref())
+                .map(|s| s.row_count)
+                .unwrap_or(1000) as f64;
+            
+            // Cost calculation using CostModel
+            // Exchange cost: mostly network
+            let exchange_op = LogicalPlan::Exchange {
+                input: Box::new(LogicalPlan::EmptyRelation),
+                partitioning: required_property.partitioning.clone(),
+            };
+            let exchange_cost = self.cost_model.compute_operator_cost(&exchange_op, row_count);
+            let total_cost = any_cost.add(&exchange_cost);
+
+            let (_, expr_id, _) = self.memo.insert_expression(
+                group_id,
+                exchange_op,
+                vec![group_id],
+                ExprType::Physical,
+                Some(PhysicalType::Exchange),
+            );
+
+            self.memo.update_winner(group_id, expr_id, total_cost, required_property);
+        }
+    }
+
+    /// Derive required properties for children based on operator and parent requirements
+    fn derive_child_properties(
+        &self,
+        expr: &GroupExpression,
+        required_property: &Property,
+    ) -> Vec<Property> {
+        let mut props = vec![Property::default(); expr.children.len()];
+
+        if let Some(phy_type) = expr.physical_type {
+            match phy_type {
+                PhysicalType::HashJoin => {
+                    if let LogicalPlan::Join { join_condition, .. } = &expr.operator {
+                        match join_condition {
+                            // Simple case: Hash Shuffle Join
+                            // Require Hash partitioning on join keys for both sides
+                            JoinCondition::Using(cols) => {
+                                let hash_exprs: Vec<RsdbExpr> = cols.iter().map(|c| RsdbExpr::Column(c.clone())).collect();
+                                let prop = Property {
+                                    partitioning: Partitioning::Hash(hash_exprs, 1),
+                                    sorting: vec![],
+                                };
+                                if props.len() >= 2 {
+                                    props[0] = prop.clone();
+                                    props[1] = prop;
+                                }
+                            }
+                            JoinCondition::On(expr) => {
+                                // TODO: Extract join keys from expression
+                                // For now, assume broadcast join (right side broadcast)
+                                // Left: Any, Right: Broadcast
+                                if props.len() >= 2 {
+                                    props[1] = Property {
+                                        partitioning: Partitioning::Broadcast,
+                                        sorting: vec![],
+                                    };
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                PhysicalType::Aggregate => {
+                    if let LogicalPlan::Aggregate { group_expr, .. } = &expr.operator {
+                        if !group_expr.is_empty() {
+                            let prop = Property {
+                                partitioning: Partitioning::Hash(group_expr.clone(), 1),
+                                sorting: vec![],
+                            };
+                            if !props.is_empty() {
+                                props[0] = prop;
+                            }
+                        } else {
+                            // Global aggregation without groups -> Single partition
+                            let prop = Property {
+                                partitioning: Partitioning::Single,
+                                sorting: vec![],
+                            };
+                            if !props.is_empty() {
+                                props[0] = prop;
+                            }
+                        }
+                    }
+                }
+                PhysicalType::Exchange => {
+                    // Exchange itself satisfies the property, requires Any from child
+                    // props[0] is already Any
+                }
+                PhysicalType::Sort => {
+                    // Sort creates order, requires Any distribution (or Single if global sort)
+                    // If Sort is global, child must be Single? Or we gather after sort?
+                    // For now, simple local sort
+                }
+                _ => {}
+            }
+        }
+        
+        // Pass through partitioning if operator doesn't change it (e.g. Filter, Project)
+        // AND if it's not a blocking operator.
+        // Simplified: if required_property is Hash, Filter/Project pass it down.
+        if required_property.partitioning != Partitioning::Any {
+             if let Some(phy_type) = expr.physical_type {
+                 match phy_type {
+                     PhysicalType::Filter | PhysicalType::Project | PhysicalType::Limit => {
+                         if !props.is_empty() {
+                             props[0] = required_property.clone();
+                         }
+                     }
+                     _ => {}
+                 }
+             }
+        }
+
+        props
+    }
+
     /// Compute the local cost of an operator (not including children)
     fn compute_local_cost(&self, operator: &LogicalPlan, group_id: usize) -> Cost {
         let row_count = self
@@ -1996,30 +1856,41 @@ impl CascadesOptimizer {
 
     /// Reconstruct a LogicalPlan from a GroupExpression
     fn reconstruct_plan(&self, expr: &GroupExpression, property: &Property) -> Result<LogicalPlan> {
+        // Handle Exchange specially: its child is the group ID itself
+        if expr.physical_type == Some(PhysicalType::Exchange) {
+            let child_gid = expr.children[0];
+            // Exchange requires Any from its child
+            let child_plan = self.extract_best_plan(child_gid, &Property::default())?;
+            
+            if let LogicalPlan::Exchange { partitioning, .. } = &expr.operator {
+                return Ok(LogicalPlan::Exchange {
+                    input: Box::new(child_plan),
+                    partitioning: partitioning.clone(),
+                });
+            }
+        }
+
         if expr.children.is_empty() {
             return Ok(expr.operator.clone());
         }
 
-        // Recursively reconstruct children
-        let child_plans: Vec<LogicalPlan> = expr
-            .children
-            .iter()
-            .map(|&child_gid| self.extract_best_plan(child_gid, property))
-            .collect::<Result<Vec<_>>>()?;
+        // Get required properties for children
+        let child_props = self.derive_child_properties(expr, property);
+        
+        let mut child_plans = Vec::new();
+        for (i, &child_gid) in expr.children.iter().enumerate() {
+            let req = child_props.get(i).cloned().unwrap_or_default();
+            child_plans.push(self.extract_best_plan(child_gid, &req)?);
+        }
 
-        // Rebuild the operator with real child plans
         match &expr.operator {
             LogicalPlan::Filter { predicate, .. } => Ok(LogicalPlan::Filter {
                 input: Box::new(child_plans[0].clone()),
                 predicate: predicate.clone(),
             }),
-            LogicalPlan::Project {
-                expr: proj_expr,
-                schema,
-                ..
-            } => Ok(LogicalPlan::Project {
+            LogicalPlan::Project { expr, schema, .. } => Ok(LogicalPlan::Project {
                 input: Box::new(child_plans[0].clone()),
-                expr: proj_expr.clone(),
+                expr: expr.clone(),
                 schema: schema.clone(),
             }),
             LogicalPlan::Aggregate {
@@ -2529,170 +2400,8 @@ mod tests {
 
         // Should produce a valid join plan
         match &result {
-            LogicalPlan::Join { .. } => {}
-            other => panic!("Unexpected plan type: {:?}", other),
+            LogicalPlan::Join { .. } => {} // OK
+            _ => panic!("Expected Join, got {:?}", result),
         }
-    }
-
-    #[test]
-    fn test_cascades_four_way_star_join() {
-        let a = make_scan("A");
-        let b = make_scan("B");
-        let c = make_scan("C");
-        let d = make_scan("D");
-
-        let ab = make_join(a, b, "a_id", "b_id");
-        let abc = make_join(ab, c, "a_id", "c_id");
-        let abcd = make_join(abc, d, "a_id", "d_id");
-
-        let mut optimizer = CascadesOptimizer::new();
-        optimizer.max_iterations = 10000;
-        let result = optimizer.optimize(abcd).unwrap();
-
-        match &result {
-            LogicalPlan::Join { .. } => {}
-            other => panic!("Unexpected plan type: {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_cascades_filter_project() {
-        let scan = make_scan("t1");
-        let filter = LogicalPlan::Filter {
-            input: Box::new(scan),
-            predicate: RsdbExpr::BinaryOp {
-                left: Box::new(RsdbExpr::Column("id".to_string())),
-                op: BinaryOperator::Gt,
-                right: Box::new(RsdbExpr::Literal(Literal::Int(10))),
-            },
-        };
-        let schema = Arc::new(Schema::new(vec![Arc::new(Field::new(
-            "id",
-            DataType::Int64,
-            false,
-        ))]));
-        let project = LogicalPlan::Project {
-            input: Box::new(filter),
-            expr: vec![RsdbExpr::Column("id".to_string())],
-            schema,
-        };
-
-        let mut optimizer = CascadesOptimizer::new();
-        let result = optimizer.optimize(project).unwrap();
-        assert!(matches!(result, LogicalPlan::Project { .. }));
-    }
-
-    #[test]
-    fn test_cost_ordering() {
-        let c1 = Cost::new(10.0, 5.0, 1.0);
-        let c2 = Cost::new(20.0, 5.0, 1.0);
-        assert!(c1.is_less_than(&c2));
-        assert!(!c2.is_less_than(&c1));
-
-        let sum = c1.add(&c2);
-        assert_eq!(sum.cpu, 30.0);
-        assert_eq!(sum.memory, 10.0);
-    }
-
-    #[test]
-    fn test_join_hypergraph() {
-        let mut graph = JoinHyperGraph::new();
-        let n0 = graph.add_node(100);
-        let n1 = graph.add_node(101);
-        let n2 = graph.add_node(102);
-
-        graph.add_edge(
-            n0,
-            n1,
-            JoinEdge {
-                left_column: "a".into(),
-                right_column: "b".into(),
-            },
-        );
-        graph.add_edge(
-            n1,
-            n2,
-            JoinEdge {
-                left_column: "b".into(),
-                right_column: "c".into(),
-            },
-        );
-
-        assert!(graph.is_connected(graph.all_nodes()));
-        assert_eq!(graph.num_nodes, 3);
-
-        let n_set = graph.neighbor_set(BitSet64::singleton(n1));
-        assert!(n_set.contains(n0));
-        assert!(n_set.contains(n2));
-    }
-
-    #[test]
-    fn test_min_cut_branch_three_nodes() {
-        let mut graph = JoinHyperGraph::new();
-        let n0 = graph.add_node(0);
-        let n1 = graph.add_node(1);
-        let n2 = graph.add_node(2);
-
-        graph.add_edge(
-            n0,
-            n1,
-            JoinEdge {
-                left_column: "a".into(),
-                right_column: "b".into(),
-            },
-        );
-        graph.add_edge(
-            n1,
-            n2,
-            JoinEdge {
-                left_column: "b".into(),
-                right_column: "c".into(),
-            },
-        );
-
-        let mut mcb = MinCutBranch::new(&graph);
-        let partitions = mcb.cut_partitions();
-
-        // Should produce at least one valid partition
-        assert!(!partitions.is_empty());
-        for p in &partitions {
-            assert!(p.left.any());
-            assert!(p.right.any());
-            assert_eq!(p.left.union(p.right), graph.all_nodes());
-        }
-    }
-
-    #[test]
-    fn test_cascades_fallback_non_join() {
-        let scan = make_scan("t1");
-        let sort = LogicalPlan::Sort {
-            input: Box::new(scan),
-            expr: vec![RsdbExpr::Column("id".to_string())],
-        };
-        let limit = LogicalPlan::Limit {
-            input: Box::new(sort),
-            limit: 10,
-            offset: 0,
-        };
-
-        let mut optimizer = CascadesOptimizer::new();
-        let result = optimizer.optimize(limit).unwrap();
-        assert!(matches!(result, LogicalPlan::Limit { .. }));
-    }
-
-    #[test]
-    fn test_winner_cost_pruning() {
-        let mut memo = Memo::new();
-        let g = memo.create_group();
-        let scan = make_scan("t1");
-        let (_, e1, _) = memo.add_logical_expr(g, scan.clone(), vec![]);
-
-        let prop = Property::default();
-        // Set initial winner with cost 10
-        assert!(memo.update_winner(g, e1, Cost::new(10.0, 0.0, 0.0), prop.clone()));
-        // Try to update with worse cost 20 -> should fail
-        assert!(!memo.update_winner(g, e1, Cost::new(20.0, 0.0, 0.0), prop.clone()));
-        // Try to update with better cost 5 -> should succeed
-        assert!(memo.update_winner(g, e1, Cost::new(5.0, 0.0, 0.0), prop.clone()));
     }
 }

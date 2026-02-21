@@ -15,7 +15,9 @@ rsdb-network = { path = "../rsdb-network" }
 arrow-array = { workspace = true }
 arrow-ipc = { workspace = true }
 arrow-schema = { workspace = true }
+arrow-flight = { workspace = true }
 datafusion = { workspace = true }
+uuid = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
@@ -25,6 +27,8 @@ chrono = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }
 anyhow = { workspace = true }
+datafusion-substrait = { workspace = true }
+futures = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

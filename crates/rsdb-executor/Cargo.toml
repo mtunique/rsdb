@@ -13,11 +13,15 @@ rsdb-sql = { path = "../rsdb-sql" }
 arrow = { workspace = true }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
+arrow-ipc = { workspace = true }
 datafusion = { workspace = true }
 datafusion-common = { workspace = true }
 datafusion-expr = { workspace = true }
+datafusion-physical-plan = { workspace = true }
 datafusion-substrait = { workspace = true }
 prost = { workspace = true }
+arrow-flight = { workspace = true, features = ["flight-sql-experimental"] }
+tonic = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }

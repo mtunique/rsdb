@@ -157,6 +157,14 @@ impl SubqueryDecorrelation {
                 })
             }
 
+            LogicalPlan::SubqueryAlias { input, alias } => {
+                let new_input = Box::new(self.decorrelate(*input)?);
+                Ok(LogicalPlan::SubqueryAlias {
+                    input: new_input,
+                    alias,
+                })
+            }
+
             // Recursively process other plan types
             LogicalPlan::Scan { .. } => Ok(plan),
 
@@ -254,6 +262,28 @@ impl SubqueryDecorrelation {
             LogicalPlan::DropTable { .. } => Ok(plan),
             LogicalPlan::Insert { .. } => Ok(plan),
             LogicalPlan::Analyze { .. } => Ok(plan),
+            LogicalPlan::SubqueryAlias { input, alias } => {
+                let new_input = Box::new(self.decorrelate(*input)?);
+                Ok(LogicalPlan::SubqueryAlias {
+                    input: new_input,
+                    alias,
+                })
+            }
+            LogicalPlan::Exchange { input, partitioning } => {
+                let new_input = Box::new(self.decorrelate(*input)?);
+                Ok(LogicalPlan::Exchange {
+                    input: new_input,
+                    partitioning,
+                })
+            }
+            LogicalPlan::RemoteExchange { input, partitioning, sources } => {
+                let new_input = Box::new(self.decorrelate(*input)?);
+                Ok(LogicalPlan::RemoteExchange {
+                    input: new_input,
+                    partitioning,
+                    sources,
+                })
+            }
             LogicalPlan::EmptyRelation => Ok(plan),
         }
     }
@@ -263,6 +293,8 @@ impl SubqueryDecorrelation {
         match plan {
             LogicalPlan::Scan { .. } => Ok(plan),
             LogicalPlan::EmptyRelation => Ok(plan),
+            LogicalPlan::Exchange { .. } => Ok(plan),
+            LogicalPlan::RemoteExchange { .. } => Ok(plan),
             LogicalPlan::Subquery { query, schema } => Ok(LogicalPlan::Subquery { query, schema }),
             LogicalPlan::Project {
                 input,
@@ -325,6 +357,7 @@ impl SubqueryDecorrelation {
             LogicalPlan::DropTable { .. } => Ok(plan),
             LogicalPlan::Insert { .. } => Ok(plan),
             LogicalPlan::Analyze { .. } => Ok(plan),
+            LogicalPlan::SubqueryAlias { input, alias } => Ok(LogicalPlan::SubqueryAlias { input, alias }),
         }
     }
 }
@@ -366,6 +399,17 @@ fn collect_subqueries(expr: &RsdbExpr, subqueries: &mut Vec<SubqueryInfo>) {
         }
         RsdbExpr::Cast { expr, .. } => {
             collect_subqueries(expr, subqueries);
+        }
+        RsdbExpr::Case { operand, conditions, results, else_result } => {
+            if let Some(op) = operand {
+                collect_subqueries(op, subqueries);
+            }
+            for e in conditions.iter().chain(results.iter()) {
+                collect_subqueries(e, subqueries);
+            }
+            if let Some(else_res) = else_result {
+                collect_subqueries(else_res, subqueries);
+            }
         }
         RsdbExpr::Column(_) | RsdbExpr::Literal(_) => {}
     }

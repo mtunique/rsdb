@@ -1,6 +1,5 @@
-//! Worker node implementation
-
 use crate::task_runner::TaskRunner;
+use crate::result_manager::ResultManager;
 use rsdb_catalog::CatalogProvider;
 use rsdb_common::rpc::coordinator_control_client::CoordinatorControlClient;
 use rsdb_common::rpc::{HeartbeatRequest, RegisterWorkerRequest};
@@ -9,6 +8,7 @@ use rsdb_executor::ExecutionEngine;
 use rsdb_storage::StorageEngine;
 use std::sync::Arc;
 use tonic::transport::Channel;
+use datafusion::physical_plan::SendableRecordBatchStream;
 
 /// Worker node
 pub struct Worker {
@@ -17,6 +17,7 @@ pub struct Worker {
     _storage: Arc<dyn StorageEngine>,
     executor: Arc<dyn ExecutionEngine>,
     task_runner: TaskRunner,
+    result_manager: Arc<ResultManager>,
 }
 
 impl Worker {
@@ -32,7 +33,16 @@ impl Worker {
             _storage: storage,
             executor: executor.clone(),
             task_runner: TaskRunner::with_executor(executor),
+            result_manager: Arc::new(ResultManager::new()),
         }
+    }
+
+    pub fn take_result(&self, task_id: &str, partition_id: usize) -> Result<SendableRecordBatchStream> {
+        self.result_manager.take_result(task_id, partition_id)
+    }
+
+    pub fn register_result(&self, task_id: &str, streams: Vec<SendableRecordBatchStream>) {
+        self.result_manager.register_result(task_id, streams);
     }
 
     fn tonic_endpoint_from_addr(addr: &str) -> String {
@@ -51,9 +61,6 @@ impl Worker {
     }
 
     /// Register with coordinator.
-    ///
-    /// `coordinator_addr` is usually the same as FlightSQL listen addr (host:port).
-    /// `self_addr` is the worker task server listen addr (host:port).
     pub async fn register(&self, coordinator_addr: &str, self_addr: &NodeAddr) -> Result<()> {
         let mut client = Self::control_client(coordinator_addr).await?;
         client
@@ -88,12 +95,20 @@ impl Worker {
         }
     }
 
-    /// Execute a task (fragment)
-    pub async fn execute_task(
+    /// Execute a task (fragment) streaming
+    pub async fn execute_task_stream(
         &self,
         fragment_bytes: Vec<u8>,
-    ) -> Result<Vec<arrow_array::RecordBatch>> {
-        self.task_runner.execute(fragment_bytes).await
+        sources: Vec<rsdb_common::rpc::RemoteSource>,
+    ) -> Result<SendableRecordBatchStream> {
+        self.task_runner.execute_stream(fragment_bytes, sources).await
+    }
+
+    pub fn datafusion_engine(&self) -> Result<&rsdb_executor::DataFusionEngine> {
+        self.executor
+            .as_any()
+            .downcast_ref::<rsdb_executor::DataFusionEngine>()
+            .ok_or_else(|| RsdbError::Worker("Engine is not DataFusion".to_string()))
     }
 
     pub fn node_id(&self) -> NodeId {
@@ -111,11 +126,7 @@ impl Worker {
         has_header: bool,
         delimiter: u8,
     ) -> Result<()> {
-        let engine = self
-            .executor
-            .as_any()
-            .downcast_ref::<rsdb_executor::DataFusionEngine>()
-            .ok_or_else(|| RsdbError::Worker("Engine is not DataFusion".to_string()))?;
+        let engine = self.datafusion_engine()?;
         engine
             .register_csv(
                 table_name,
@@ -129,11 +140,7 @@ impl Worker {
     }
 
     pub async fn register_parquet(&self, table_name: &str, path: &str) -> Result<()> {
-        let engine = self
-            .executor
-            .as_any()
-            .downcast_ref::<rsdb_executor::DataFusionEngine>()
-            .ok_or_else(|| RsdbError::Worker("Engine is not DataFusion".to_string()))?;
+        let engine = self.datafusion_engine()?;
         let ctx = engine.session_context();
         ctx.register_parquet(
             table_name,

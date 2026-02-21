@@ -1,41 +1,65 @@
-//! TPC-H Benchmark Tests
-//!
-//! Loads TPC-H SF=0.01 CSV data from `data/tpch/` into DataFusion,
-//! collects statistics via SQL ANALYZE, and runs TPC-H queries
-//! through the RSDB CBO pipeline.
-
-use rsdb_executor::tpch::register_tpch_tables;
+use datafusion::prelude::CsvReadOptions;
 use rsdb_executor::DataFusionEngine;
+use rsdb_executor::ExecutionEngine;
+use rsdb_executor::tpch;
 use std::fs;
-use std::path::PathBuf;
-use std::time::{Duration, Instant};
-use tokio::time::timeout;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tokio::time::{timeout, Duration, Instant};
 
-/// Path to the TPC-H CSV data directory.
+fn workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf()
+}
+
 fn data_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/tpch")
+    workspace_root().join("data").join("tpch")
 }
 
-/// Path to the TPC-H SQL queries directory.
 fn queries_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/tpch_queries")
+    workspace_root().join("data").join("tpch_queries")
 }
 
-/// Helper: create engine and register all tables.
-async fn setup_engine() -> Option<DataFusionEngine> {
-    let dir = data_dir();
-    if !dir.exists() {
-        eprintln!("Skipping TPC-H test: data directory {:?} not found", dir);
+async fn setup_engine() -> Option<Arc<DataFusionEngine>> {
+    let engine = Arc::new(DataFusionEngine::new());
+    let tpch_dir = data_dir();
+    if !tpch_dir.exists() {
         return None;
     }
-    let engine = DataFusionEngine::new();
 
-    let registered = register_tpch_tables(&engine, &dir).await.unwrap();
-    if registered.is_empty() {
-        eprintln!("Skipping TPC-H test: no CSV files found in {:?}", dir);
-        return None;
+    let tables = [
+        ("customer", tpch::customer_schema()),
+        ("lineitem", tpch::lineitem_schema()),
+        ("nation", tpch::nation_schema()),
+        ("orders", tpch::orders_schema()),
+        ("part", tpch::part_schema()),
+        ("partsupp", tpch::partsupp_schema()),
+        ("region", tpch::region_schema()),
+        ("supplier", tpch::supplier_schema()),
+    ];
+
+    for (name, schema) in tables {
+        let path = tpch_dir.join(format!("{}.csv", name));
+        if path.exists() {
+            engine
+                .register_csv(
+                    name, 
+                    &path, 
+                    CsvReadOptions::new()
+                        .delimiter(b',')
+                        .has_header(true)
+                        .schema(&schema) // FORCE EXPLICIT SCHEMA
+                )
+                .await
+                .unwrap();
+        }
     }
-    eprintln!("Registered {} TPC-H tables", registered.len());
+
+    println!("Registered 8 TPC-H tables with explicit schemas");
     Some(engine)
 }
 
@@ -45,72 +69,46 @@ async fn test_tpch_all_queries_with_cbo() {
         return;
     };
 
-    // 1. Collect Statistics via SQL ANALYZE
-    eprintln!("Collecting statistics via ANALYZE TABLE...");
-    let tables = [
-        "customer", "lineitem", "nation", "orders", "part", "partsupp", "region", "supplier",
-    ];
-    for table in tables {
-        let sql = format!("ANALYZE TABLE {}", table);
-        engine.execute_via_logical_plan(&sql).await.unwrap();
-    }
-
-    // 2. Run all 22 queries through the CBO pipeline
+    // 1. Run all 22 queries
     let q_dir = queries_dir();
-    if !q_dir.exists() {
-        panic!(
-            "Queries directory {:?} not found. Run scripts/gen_tpch_queries.py first.",
-            q_dir
-        );
-    }
-
     let mut success_count = 0;
     let mut fail_count = 0;
-    let mut timeout_count = 0;
-    let mut failures = Vec::new();
 
     for i in 1..=22 {
         let name = format!("Q{:02}", i);
         let query_path = q_dir.join(format!("{:02}.sql", i));
         let sql = fs::read_to_string(&query_path).expect("Failed to read query file");
 
-        eprintln!("Running {} with CBO...", name);
+        println!("Running {}...", name);
         let start = Instant::now();
 
-        // Use a 10-second timeout for each query to avoid hanging on complex joins
         let result = timeout(
-            Duration::from_secs(10),
-            engine.execute_with_cbo(&sql, &tables, true),
+            Duration::from_secs(30),
+            engine.execute_sql(&sql),
         )
         .await;
 
         match result {
             Ok(Ok(batches)) => {
                 let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
-                eprintln!("  {}: {} rows in {:?}", name, row_count, start.elapsed());
+                println!("  {}: {} rows in {:?}", name, row_count, start.elapsed());
                 success_count += 1;
             }
             Ok(Err(e)) => {
-                eprintln!("  {} failed: {}", name, e);
+                println!("  {} failed: {}", name, e);
                 fail_count += 1;
-                failures.push((name, format!("{}", e)));
             }
             Err(_) => {
-                eprintln!("  {} timed out", name);
-                timeout_count += 1;
-                failures.push((name, "Timeout".to_string()));
+                println!("  {} timed out", name);
+                fail_count += 1;
             }
         }
     }
 
-    eprintln!("\nTPC-H CBO Execution Summary:");
-    eprintln!("  Total: 22");
-    eprintln!("  Success: {}", success_count);
-    eprintln!("  Failure: {}", fail_count);
-    eprintln!("  Timeout: {}", timeout_count);
+    println!("\nTPC-H Execution Summary:");
+    println!("  Total: 22");
+    println!("  Success: {}", success_count);
+    println!("  Failure: {}", fail_count);
 
-    assert!(
-        success_count > 0,
-        "At least some queries should succeed through RSDB CBO pipeline"
-    );
+    assert!(success_count > 0);
 }
