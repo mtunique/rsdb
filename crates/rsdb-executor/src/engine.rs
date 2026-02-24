@@ -284,15 +284,6 @@ fn explain_plan_with_stats(plan: &RsdbLogicalPlan, cbo: &rsdb_planner::CBOContex
             };
             format!("Exchange: {}", p_str)
         },
-        RsdbLogicalPlan::SubqueryAlias { alias, input } => {
-            // Visual optimization: Merge Alias into Scan
-            if let RsdbLogicalPlan::Scan { table_name, filters, .. } = input.as_ref() {
-                format!("Scan: {} [Filters: {:?}] (alias: {})", table_name, filters.len(), alias)
-            } else {
-                format!("SubqueryAlias: {}", alias)
-            }
-        },
-        RsdbLogicalPlan::Union { .. } => "Union".to_string(),
         RsdbLogicalPlan::Explain { .. } => "Explain".to_string(),
         _ => format!("{:?}", plan),
     };
@@ -309,13 +300,6 @@ fn explain_plan_with_stats(plan: &RsdbLogicalPlan, cbo: &rsdb_planner::CBOContex
         | RsdbLogicalPlan::Exchange { input, .. } => {
             output.push('\n');
             output.push_str(&explain_plan_with_stats(input, cbo, indent + 1));
-        }
-        RsdbLogicalPlan::SubqueryAlias { input, .. } => {
-            // If we merged it, don't recurse. If not, recurse.
-            if !matches!(input.as_ref(), RsdbLogicalPlan::Scan { .. }) {
-                output.push('\n');
-                output.push_str(&explain_plan_with_stats(input, cbo, indent + 1));
-            }
         }
         RsdbLogicalPlan::Join { left, right, .. } | RsdbLogicalPlan::CrossJoin { left, right, .. } => {
             output.push('\n');

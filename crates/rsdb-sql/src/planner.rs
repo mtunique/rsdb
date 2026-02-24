@@ -232,8 +232,13 @@ impl SqlPlanner {
             }).collect();
 
             let mut final_fields = Vec::new();
-            for expr in &project_exprs {
-                final_fields.push(Field::new(expr.to_string(), DataType::Null, true));
+            for (i, expr) in project_exprs.iter().enumerate() {
+                let name = match &projection_exprs[i] {
+                    RsdbExpr::Alias { name, .. } => name.clone(),
+                    RsdbExpr::Column(n) => n.clone(),
+                    _ => expr.to_string(),
+                };
+                final_fields.push(Field::new(name, DataType::Null, true));
             }
             
             plan = LogicalPlan::Project {
@@ -242,14 +247,19 @@ impl SqlPlanner {
                 schema: Arc::new(Schema::new(final_fields)),
             };
         } else {
-            let mut fields = Vec::new();
-            for expr in &projection_exprs {
-                fields.push(Field::new(expr.to_string(), DataType::Null, true));
+            let mut final_fields = Vec::new();
+            for (i, expr) in projection_exprs.iter().enumerate() {
+                let name = match &projection_exprs[i] {
+                    RsdbExpr::Alias { name, .. } => name.clone(),
+                    RsdbExpr::Column(n) => n.clone(),
+                    _ => expr.to_string(),
+                };
+                final_fields.push(Field::new(name, DataType::Null, true));
             }
             plan = LogicalPlan::Project {
                 input: Box::new(plan),
                 expr: projection_exprs,
-                schema: Arc::new(Schema::new(fields)),
+                schema: Arc::new(Schema::new(final_fields)),
             };
         }
         Ok(plan)
@@ -316,11 +326,19 @@ impl SqlPlanner {
                 let table_name = name.0.first().map(|n| n.value.clone()).unwrap();
                 let alias_name = alias.as_ref().map(|a| a.name.value.clone()).unwrap_or_else(|| table_name.clone());
                 let plan = if let Some(p) = cte_map.get(&table_name) { p.clone() } else {
-                    let schema = self.catalog.schema("default").and_then(|s| s.table(&table_name)).map(|t| t.schema.clone())
+                    let mut schema = self.catalog.schema("default").and_then(|s| s.table(&table_name)).map(|t| t.schema.clone())
                         .ok_or_else(|| RsdbError::Planner(format!("Table {} not found", table_name)))?;
+                    
+                    // STRIP QUALIFIERS from Scan schema to ensure clean names
+                    let fields: Vec<_> = schema.fields().iter().map(|f| {
+                        let clean_name = f.name().split('.').last().unwrap_or(f.name());
+                        Field::new(clean_name, f.data_type().clone(), f.is_nullable())
+                    }).collect();
+                    schema = Arc::new(Schema::new(fields));
+
                     LogicalPlan::Scan { table_name: table_name.clone(), schema, projection: None, filters: vec![] }
                 };
-                // Alias as Projection
+                // Alias using Project
                 Ok(self.apply_alias(plan, &alias_name, None))
             }
             TableFactor::Derived { subquery, alias, .. } => {
@@ -351,25 +369,17 @@ impl SqlPlanner {
 
         for (i, field) in schema.fields().iter().enumerate() {
             let old_name = field.name();
+            // Prefix all columns with alias to simulate SubqueryAlias scope
+            // Standard: "alias.col"
+            let simple_name = old_name.split('.').last().unwrap_or(old_name);
             
-            // Determine new name
-            // 1. If explicit column aliases provided, use them
-            // 2. Otherwise prefix with table alias
             let new_name = if let Some(cols) = &column_aliases {
                 if i < cols.len() {
-                    // Explicit alias: "alias.col" (we qualify it to be safe)
                     format!("{}.{}", alias, cols[i])
                 } else {
-                    // Fallback to prefix
-                    format!("{}.{}", alias, old_name)
+                    format!("{}.{}", alias, simple_name)
                 }
             } else {
-                // Prefix with table alias
-                // Important: If old_name already has dots, we might just be re-aliasing.
-                // Standard SQL: Alias REPLACES the old qualifier.
-                // So t1.a aliased as t2 becomes t2.a.
-                // We take the simple name (last part) and prepend the new alias.
-                let simple_name = old_name.split('.').last().unwrap_or(old_name);
                 format!("{}.{}", alias, simple_name)
             };
 
@@ -377,7 +387,6 @@ impl SqlPlanner {
                 expr: Box::new(RsdbExpr::Column(old_name.clone())),
                 name: new_name.clone(),
             });
-            
             fields.push(Field::new(new_name, field.data_type().clone(), field.is_nullable()));
         }
 
@@ -415,9 +424,15 @@ impl SqlPlanner {
                     // Return the FULL qualified name
                     Ok(RsdbExpr::Column(matches[0].clone()))
                 } else if matches.len() > 1 {
-                    Err(RsdbError::Planner(format!("Ambiguous column reference: {}", name)))
+                    // Priority: if any match is an exact simple name match (e.g. name="id" matches "id" and "t1.id"), pick "id"
+                    let exact_matches: Vec<_> = matches.iter().filter(|m| *m == &name).collect();
+                    if exact_matches.len() == 1 {
+                        Ok(RsdbExpr::Column(exact_matches[0].clone()))
+                    } else {
+                        Err(RsdbError::Planner(format!("Ambiguous column reference: {}", name)))
+                    }
                 } else {
-                    // If not found, return as is (might be resolved later or valid in context)
+                    // Try case-insensitive or partial match if needed, but for now just return
                     Ok(RsdbExpr::Column(name))
                 }
             }

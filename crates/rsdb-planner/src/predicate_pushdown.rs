@@ -67,9 +67,6 @@ impl PredicatePushdown {
                     schema: schema.clone(),
                 })
             }
-            LogicalPlan::SubqueryAlias { .. } => {
-                unreachable!("SubqueryAlias should have been eliminated by EliminateSubqueryAlias rule");
-            }
             LogicalPlan::Explain { input } => {
                 Ok(LogicalPlan::Explain {
                     input: Box::new(self.push_down(input)?),
@@ -80,7 +77,7 @@ impl PredicatePushdown {
         }
     }
 
-    fn push_predicate(&self, plan: LogicalPlan, predicate: Expr) -> Result<LogicalPlan> {
+    fn push_predicate(&mut self, plan: LogicalPlan, predicate: Expr) -> Result<LogicalPlan> {
         // Split predicate into conjunctions (ANDs)
         let predicates = self.split_conjunction(&predicate);
         
@@ -103,7 +100,7 @@ impl PredicatePushdown {
         exprs
     }
 
-    fn push_predicates_recursive(&self, plan: LogicalPlan, predicates: Vec<Expr>) -> Result<LogicalPlan> {
+    fn push_predicates_recursive(&mut self, plan: LogicalPlan, predicates: Vec<Expr>) -> Result<LogicalPlan> {
         if predicates.is_empty() {
             return Ok(plan);
         }
@@ -185,9 +182,6 @@ impl PredicatePushdown {
                 let mut all_preds = predicates;
                 all_preds.extend(self.split_conjunction(&predicate));
                 self.push_predicates_recursive(*input, all_preds)
-            }
-            LogicalPlan::SubqueryAlias { .. } => {
-                unreachable!("SubqueryAlias should have been eliminated by EliminateSubqueryAlias rule");
             }
             LogicalPlan::Project { input, expr: project_exprs, schema } => {
                 // Map predicates through projection

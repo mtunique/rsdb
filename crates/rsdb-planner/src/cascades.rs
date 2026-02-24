@@ -2290,7 +2290,6 @@ pub fn has_joins(plan: &LogicalPlan) -> bool {
         | LogicalPlan::Sort { input, .. }
         | LogicalPlan::Limit { input, .. }
         | LogicalPlan::Subquery { query: input, .. }
-        | LogicalPlan::SubqueryAlias { input, .. }
         | LogicalPlan::Explain { input }
         | LogicalPlan::Exchange { input, .. }
         | LogicalPlan::RemoteExchange { input, .. } => has_joins(input),

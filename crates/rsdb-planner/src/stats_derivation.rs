@@ -87,7 +87,13 @@ impl<'a> StatsDerivator for JoinStatsDerivator<'a> {
 
         let card_product = left.row_count as f64 * right.row_count as f64;
         let mut row_count = if card_product.is_finite() {
-            (card_product * selectivity).ceil() as u64
+            let mut derived = (card_product * selectivity).ceil() as u64;
+            // Cap for Equi-Join: Shouldn't exceed the product, but usually 
+            // closer to the larger side in 1:N relationships.
+            if matches!(self.condition, JoinCondition::On(_) | JoinCondition::Using(_)) {
+                derived = derived.min(std::cmp::max(left.row_count, right.row_count) * 2);
+            }
+            derived
         } else {
             u64::MAX
         };
@@ -269,9 +275,6 @@ pub fn derive_stats_recursive(plan: &LogicalPlan, cbo: &CBOContext) -> PlanStats
             derivator.derive(&[&input_stats], cbo)
         }
         LogicalPlan::Exchange { input, .. } => {
-            derive_stats_recursive(input, cbo)
-        }
-        LogicalPlan::SubqueryAlias { input, .. } => {
             derive_stats_recursive(input, cbo)
         }
         LogicalPlan::Explain { input } => derive_stats_recursive(input, cbo),

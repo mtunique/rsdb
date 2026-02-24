@@ -5,7 +5,7 @@ use datafusion::datasource::provider_as_source;
 use datafusion::functions_aggregate::expr_fn as agg_fn;
 use datafusion::logical_expr::{
     table_scan, LogicalPlan, LogicalPlanBuilder, Operator, SortExpr,
-    SubqueryAlias, expr::ScalarFunction,
+    expr::ScalarFunction,
 };
 use datafusion::prelude::{col, lit, Expr, JoinType, SessionContext};
 use rsdb_common::{Result, RsdbError};
@@ -37,8 +37,7 @@ pub fn to_datafusion_plan_with_sources(
                 builder = builder.filter(to_datafusion_expr(filter, ctx)?)
                     .map_err(|e| RsdbError::Execution(format!("filter error: {e}")))?;
             }
-            let scan = builder.build().map_err(|e| RsdbError::Execution(format!("build error: {e}")))?;
-            Ok(LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(Arc::new(scan), table_name.clone()).unwrap()))
+            builder.build().map_err(|e| RsdbError::Execution(format!("build error: {e}")))
         }
 
         RsdbLogicalPlan::Filter { input, predicate } => {
@@ -52,7 +51,15 @@ pub fn to_datafusion_plan_with_sources(
             let input_plan = to_datafusion_plan_with_sources(input, ctx, remote_sources)?;
             let df_exprs: Result<Vec<_>> = exprs.iter().enumerate().map(|(i, e)| {
                 let df_e = to_datafusion_expr(e, ctx)?;
-                Ok(df_e.alias(schema.field(i).name()))
+                let name = schema.field(i).name();
+                // If name has a dot, use it as a qualifier for DataFusion
+                if let Some(pos) = name.find('.') {
+                    let relation = &name[..pos];
+                    let col_name = &name[pos+1..];
+                    Ok(df_e.alias_qualified(Some(relation), col_name))
+                } else {
+                    Ok(df_e.alias(name))
+                }
             }).collect();
             LogicalPlanBuilder::from(input_plan).project(df_exprs?)
                 .map_err(|e| RsdbError::Execution(format!("project error: {e}")))?
@@ -102,11 +109,6 @@ pub fn to_datafusion_plan_with_sources(
             LogicalPlanBuilder::from(left_plan).cross_join(right_plan)
                 .map_err(|e| RsdbError::Execution(format!("cross join error: {e}")))?
                 .build().map_err(|e| RsdbError::Execution(format!("build error: {e}")))
-        }
-
-        RsdbLogicalPlan::SubqueryAlias { input, alias } => {
-            let input_plan = to_datafusion_plan_with_sources(input, ctx, remote_sources)?;
-            Ok(LogicalPlan::SubqueryAlias(SubqueryAlias::try_new(Arc::new(input_plan), alias.clone()).unwrap()))
         }
 
         RsdbLogicalPlan::Sort { input, expr } => {
@@ -169,14 +171,16 @@ pub fn to_datafusion_plan_with_sources(
 pub fn to_datafusion_expr(expr: &RsdbExpr, ctx: &SessionContext) -> Result<Expr> {
     match expr {
         RsdbExpr::Column(name) => {
-            // Planner produces flat names with dots (e.g. "customer.c_acctbal" or "custsale.customer.c_acctbal").
-            // DataFusion's Column struct has separate relation and name fields.
-            // We split at the first dot to match DataFusion's SubqueryAlias behavior where the alias becomes the relation.
-            if let Some(i) = name.find('.') {
-                let relation = &name[..i];
+            // After removing SubqueryAlias, the planner produces names like "table.col".
+            // DataFusion expects these to be mapped to Column { relation, name }.
+            if let Some(i) = name.rfind('.') {
                 let column = &name[i+1..];
-                Ok(Expr::Column(datafusion::common::Column::new(Some(relation), column)))
+                let relation = &name[..i];
+                // Take only the last relation part to avoid deep nesting issues
+                let final_relation = relation.split('.').last().unwrap_or(relation);
+                Ok(Expr::Column(datafusion::common::Column::new(Some(final_relation), column)))
             } else {
+                // For simple names, let DataFusion's context-aware resolution find the column
                 Ok(col(name))
             }
         }

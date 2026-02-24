@@ -78,12 +78,6 @@ pub enum LogicalPlan {
         schema: SchemaRef,
     },
 
-    /// Alias for a subquery or relation
-    SubqueryAlias {
-        input: Box<LogicalPlan>,
-        alias: String,
-    },
-
     /// Create table DDL
     CreateTable {
         table_name: String,
@@ -180,13 +174,6 @@ impl LogicalPlan {
             LogicalPlan::CrossJoin { schema, .. } => schema.clone(),
             LogicalPlan::Union { schema, .. } => schema.clone(),
             LogicalPlan::Subquery { schema, .. } => schema.clone(),
-            LogicalPlan::SubqueryAlias { input, alias } => {
-                let schema = input.schema();
-                let fields: Vec<_> = schema.fields().iter().map(|f| {
-                    Field::new(format!("{}.{}", alias, f.name()), f.data_type().clone(), f.is_nullable())
-                }).collect();
-                Arc::new(Schema::new(fields))
-            }
             LogicalPlan::CreateTable { schema, .. } => schema.clone(),
             LogicalPlan::DropTable { .. } => Arc::new(Schema::empty()),
             LogicalPlan::Insert { source, .. } => source.schema(),
@@ -224,7 +211,6 @@ impl LogicalPlan {
                 refs
             }
             LogicalPlan::Subquery { query, .. } => query.table_refs(),
-            LogicalPlan::SubqueryAlias { input, .. } => input.table_refs(),
             LogicalPlan::CreateTable { .. } => vec![],
             LogicalPlan::DropTable { table_name, .. } => vec![table_name.clone()],
             LogicalPlan::Insert { source, .. } => source.table_refs(),

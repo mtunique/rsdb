@@ -60,7 +60,6 @@ impl ExprFingerprint {
             LogicalPlan::CrossJoin { .. } => ("CrossJoin".to_string(), String::new()),
             LogicalPlan::Union { .. } => ("Union".to_string(), String::new()),
             LogicalPlan::Subquery { .. } => ("Subquery".to_string(), String::new()),
-            LogicalPlan::SubqueryAlias { alias, .. } => ("SubqueryAlias".to_string(), alias.clone()),
             LogicalPlan::Exchange { partitioning, .. } => {
                 ("Exchange".to_string(), format!("{:?}", partitioning))
             }

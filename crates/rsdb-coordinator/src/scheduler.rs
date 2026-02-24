@@ -126,12 +126,6 @@ impl Scheduler {
                     schema: schema.clone(),
                 })
             }
-            LogicalPlan::SubqueryAlias { input, alias } => {
-                Ok(LogicalPlan::SubqueryAlias {
-                    input: Box::new(self.rewrite_plan_for_execution(input, schedule)?),
-                    alias: alias.clone(),
-                })
-            }
             LogicalPlan::Sort { input, expr } => {
                 Ok(LogicalPlan::Sort {
                     input: Box::new(self.rewrite_plan_for_execution(input, schedule)?),

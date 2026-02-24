@@ -64,7 +64,6 @@ impl FragmentPlanner {
                     | LogicalPlan::Sort { input, .. }
                     | LogicalPlan::Limit { input, .. }
                     | LogicalPlan::Subquery { query: input, .. }
-                    | LogicalPlan::SubqueryAlias { input, .. }
                     | LogicalPlan::Explain { input, .. }
                     | LogicalPlan::Exchange { input, .. }
                     | LogicalPlan::Insert { source: input, .. } => {

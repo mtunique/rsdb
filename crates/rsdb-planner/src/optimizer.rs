@@ -157,14 +157,6 @@ impl SubqueryDecorrelation {
                 })
             }
 
-            LogicalPlan::SubqueryAlias { input, alias } => {
-                let new_input = Box::new(self.decorrelate(*input)?);
-                Ok(LogicalPlan::SubqueryAlias {
-                    input: new_input,
-                    alias,
-                })
-            }
-
             // Recursively process other plan types
             LogicalPlan::Scan { .. } => Ok(plan),
 
@@ -266,13 +258,6 @@ impl SubqueryDecorrelation {
                 let new_input = Box::new(self.decorrelate(*input)?);
                 Ok(LogicalPlan::Explain { input: new_input })
             }
-            LogicalPlan::SubqueryAlias { input, alias } => {
-                let new_input = Box::new(self.decorrelate(*input)?);
-                Ok(LogicalPlan::SubqueryAlias {
-                    input: new_input,
-                    alias,
-                })
-            }
             LogicalPlan::Exchange { input, partitioning } => {
                 let new_input = Box::new(self.decorrelate(*input)?);
                 Ok(LogicalPlan::Exchange {
@@ -362,7 +347,6 @@ impl SubqueryDecorrelation {
             LogicalPlan::Insert { .. } => Ok(plan),
             LogicalPlan::Analyze { .. } => Ok(plan),
             LogicalPlan::Explain { input } => Ok(LogicalPlan::Explain { input }),
-            LogicalPlan::SubqueryAlias { input, alias } => Ok(LogicalPlan::SubqueryAlias { input, alias }),
         }
     }
 }
@@ -627,9 +611,6 @@ impl DistributionPlanner {
                     limit,
                     offset,
                 })
-            }
-            LogicalPlan::SubqueryAlias { input, alias } => {
-                Ok(LogicalPlan::SubqueryAlias { input: Box::new(self.plan_distribution(*input)?), alias })
             }
             LogicalPlan::Explain { input } => {
                 Ok(LogicalPlan::Explain { input: Box::new(self.plan_distribution(*input)?) })
