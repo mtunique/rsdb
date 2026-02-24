@@ -254,7 +254,7 @@ impl Default for DataFusionEngine { fn default() -> Self { Self::new() } }
 
 fn explain_plan_with_stats(plan: &RsdbLogicalPlan, cbo: &rsdb_planner::CBOContext, indent: usize) -> String {
     let stats = rsdb_planner::stats_derivation::derive_stats_recursive(plan, cbo);
-    let indent_str = "  ".repeat(indent);
+    let indent_str = if indent == 0 { "".to_string() } else { format!("{}|_ ", "  ".repeat(indent - 1)) };
     
     let mut output = match plan {
         RsdbLogicalPlan::Scan { table_name, filters, .. } => {
@@ -275,7 +275,15 @@ fn explain_plan_with_stats(plan: &RsdbLogicalPlan, cbo: &rsdb_planner::CBOContex
             format!("Join: {:?} ON {:?}", join_type, join_condition)
         }
         RsdbLogicalPlan::CrossJoin { .. } => "CrossJoin".to_string(),
-        RsdbLogicalPlan::Exchange { partitioning, .. } => format!("Exchange: {:?}", partitioning),
+        RsdbLogicalPlan::Exchange { partitioning, .. } => {
+            let p_str = match partitioning {
+                rsdb_sql::logical_plan::Partitioning::Hash(keys, n) => format!("Hash({:?}, {})", keys, n),
+                rsdb_sql::logical_plan::Partitioning::Single => "Single".to_string(),
+                rsdb_sql::logical_plan::Partitioning::Broadcast => "Broadcast".to_string(),
+                _ => format!("{:?}", partitioning),
+            };
+            format!("Exchange: {}", p_str)
+        },
         RsdbLogicalPlan::SubqueryAlias { alias, input } => {
             // Visual optimization: Merge Alias into Scan
             if let RsdbLogicalPlan::Scan { table_name, filters, .. } = input.as_ref() {

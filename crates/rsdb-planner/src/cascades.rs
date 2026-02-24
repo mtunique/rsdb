@@ -2364,7 +2364,7 @@ impl UnionFind {
 
 /// Helper to extract equi-join keys from a join condition expression.
 /// Returns (left_keys, right_keys).
-fn extract_equi_join_keys(expr: &RsdbExpr) -> (Vec<RsdbExpr>, Vec<RsdbExpr>) {
+pub fn extract_equi_join_keys(expr: &RsdbExpr) -> (Vec<RsdbExpr>, Vec<RsdbExpr>) {
     let mut left_keys = vec![];
     let mut right_keys = vec![];
     
